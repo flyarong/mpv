@@ -71,6 +71,9 @@ Available video output drivers are:
     Shared memory video output driver without hardware acceleration that works
     whenever X11 is present.
 
+    Since mpv 0.30.0, you may need to use ``--profile=sw-fast`` to get decent
+    performance.
+
     .. note:: This is a fallback only, and should not be normally used.
 
 ``vdpau`` (X11 only)
@@ -201,32 +204,7 @@ Available video output drivers are:
     .. note:: This driver is for compatibility with systems that don't provide
               proper OpenGL drivers, and where ANGLE does not perform well.
 
-    .. note:: Before to 0.21.0, ``direct3d_shaders`` and ``direct3d`` were
-              different, with ``direct3d`` not using shader by default. Now
-              both use shaders by default, and ``direct3d_shaders`` is a
-              deprecated alias. Use the ``--vo-direct3d-prefer-stretchrect``
-              or the ``--vo-direct3d-disable-shaders`` options to get the old
-              behavior of ``direct3d``.
-
     The following global options are supported by this video output:
-
-    ``--vo-direct3d-prefer-stretchrect``
-        Use ``IDirect3DDevice9::StretchRect`` over other methods if possible.
-
-    ``--vo-direct3d-disable-stretchrect``
-        Never render the video using ``IDirect3DDevice9::StretchRect``.
-
-    ``--vo-direct3d-disable-textures``
-        Never render the video using D3D texture rendering. Rendering with
-        textures + shader will still be allowed. Add ``disable-shaders`` to
-        completely disable video rendering with textures.
-
-    ``--vo-direct3d-disable-shaders``
-        Never use shaders when rendering video.
-
-    ``--vo-direct3d-only-8bit``
-        Never render YUV video with more than 8 bits per component.
-        Using this flag will force software conversion to 8-bit.
 
     ``--vo-direct3d-disable-texture-align``
         Normally texture sizes are always aligned to 16. With this option
@@ -295,7 +273,7 @@ Available video output drivers are:
     the hardware decoder APIs.
 
     ``gpu`` makes use of FBOs by default. Sometimes you can achieve better
-    quality or performance by changing the ``--gpu-fbo-format`` option to
+    quality or performance by changing the ``--fbo-format`` option to
     ``rgb16f``, ``rgb32f`` or ``rgb``. Known problems include Mesa/Intel not
     accepting ``rgb16``, Mesa sometimes not being compiled with float texture
     support, and some OS X setups being very slow with ``rgb16`` but fast
@@ -382,6 +360,9 @@ Available video output drivers are:
     Color Unicode art video output driver that works on a text console.
     Depends on support of true color by modern terminals to display the images
     at full color range. On Windows it requires an ansi terminal such as mintty.
+
+    Since mpv 0.30.0, you may need to use ``--profile=sw-fast`` to get decent
+    performance.
 
     ``--vo-tct-algo=<algo>``
         Select how to write the pixels to the terminal.
@@ -481,6 +462,9 @@ Available video output drivers are:
     Should be used when one doesn't want to install full-blown graphical
     environment (e.g. no X). Does not support hardware acceleration (if you
     need this, check the ``drm`` backend for ``gpu`` VO).
+
+    Since mpv 0.30.0, you may need to use ``--profile=sw-fast`` to get decent
+    performance.
 
     The following global options are supported by this video output:
 
@@ -582,5 +566,8 @@ Available video output drivers are:
 ``wlshm`` (Wayland only)
     Shared memory video output driver without hardware acceleration that works
     whenever Wayland is present.
+
+    Since mpv 0.30.0, you may need to use ``--profile=sw-fast`` to get decent
+    performance.
 
     .. note:: This is a fallback only, and should not be normally used.

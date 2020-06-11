@@ -53,6 +53,7 @@ typedef struct screenshot_ctx {
     struct mp_cmd *each_frame;
 
     int frameno;
+    uint64_t last_frame_count;
 } screenshot_ctx;
 
 void screenshot_init(struct MPContext *mpctx)
@@ -83,7 +84,8 @@ static bool write_screenshot(struct mp_cmd_ctx *cmd, struct mp_image *img,
 
     mp_core_unlock(mpctx);
 
-    bool ok = img && write_image(img, &opts_copy, filename, mpctx->log);
+    bool ok = img && write_image(img, &opts_copy, filename, mpctx->global,
+                                 mpctx->log);
 
     mp_core_lock(mpctx);
 
@@ -370,7 +372,7 @@ static struct mp_image *screenshot_get(struct MPContext *mpctx, int mode,
 }
 
 struct mp_image *convert_image(struct mp_image *image, int destfmt,
-                               struct mp_log *log)
+                               struct mpv_global *global, struct mp_log *log)
 {
     int d_w, d_h;
     mp_image_params_get_dsize(&image->params, &d_w, &d_h);
@@ -396,7 +398,14 @@ struct mp_image *convert_image(struct mp_image *image, int destfmt,
 
     dst->params = p;
 
-    if (mp_image_swscale(dst, image, mp_sws_hq_flags) < 0) {
+    struct mp_sws_context *sws = mp_sws_alloc(NULL);
+    sws->log = log;
+    if (global)
+        mp_sws_enable_cmdline_opts(sws, global);
+    bool ok = mp_sws_scale(sws, dst, image) >= 0;
+    talloc_free(sws);
+
+    if (!ok) {
         mp_err(log, "Error when converting image.\n");
         talloc_free(dst);
         return NULL;
@@ -411,7 +420,8 @@ static struct mp_image *screenshot_get_rgb(struct MPContext *mpctx, int mode)
     struct mp_image *mpi = screenshot_get(mpctx, mode, false);
     if (!mpi)
         return NULL;
-    struct mp_image *res = convert_image(mpi, IMGFMT_BGR0, mpctx->log);
+    struct mp_image *res = convert_image(mpi, IMGFMT_BGR0, mpctx->global,
+                                         mpctx->log);
     talloc_free(mpi);
     return res;
 }
@@ -520,18 +530,22 @@ static void screenshot_fin(struct mp_cmd_ctx *cmd)
     mp_wakeup_core(mpctx);
 }
 
-void screenshot_flip(struct MPContext *mpctx)
+void handle_each_frame_screenshot(struct MPContext *mpctx)
 {
     screenshot_ctx *ctx = mpctx->screenshot_ctx;
 
     if (!ctx->each_frame)
         return;
 
+    if (ctx->last_frame_count == mpctx->shown_vframes)
+        return;
+    ctx->last_frame_count = mpctx->shown_vframes;
+
     struct mp_waiter wait = MP_WAITER_INITIALIZER;
     void *a[] = {mpctx, &wait};
     run_command(mpctx, mp_cmd_clone(ctx->each_frame), NULL, screenshot_fin, a);
 
-    // Block (in a reentrant way) until he screenshot was written. Otherwise,
+    // Block (in a reentrant way) until the screenshot was written. Otherwise,
     // we could pile up screenshot requests forever.
     while (!mp_waiter_poll(&wait))
         mp_idle(mpctx);

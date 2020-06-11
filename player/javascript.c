@@ -51,7 +51,7 @@
 // All these are generated from player/javascript/*.js
 static const char *const builtin_files[][3] = {
     {"@/defaults.js",
-#   include "player/javascript/defaults.js.inc"
+#   include "generated/player/javascript/defaults.js.inc"
     },
     {0}
 };
@@ -59,6 +59,7 @@ static const char *const builtin_files[][3] = {
 // Represents a loaded script. Each has its own js state.
 struct script_ctx {
     const char *filename;
+    const char *path; // NULL if single file
     struct mpv_handle *client;
     struct MPContext *mpctx;
     struct mp_log *log;
@@ -468,15 +469,16 @@ static int s_init_js(js_State *J, struct script_ctx *ctx)
 //
 // Note: init functions don't need autofree. They can use ctx as a talloc
 // context and free normally. If they throw - ctx is freed right afterwards.
-static int s_load_javascript(struct mpv_handle *client, const char *fname)
+static int s_load_javascript(struct mp_script_args *args)
 {
     struct script_ctx *ctx = talloc_ptrtype(NULL, ctx);
     *ctx = (struct script_ctx) {
-        .client = client,
-        .mpctx = mp_client_get_core(client),
-        .log = mp_client_get_log(client),
+        .client = args->client,
+        .mpctx = args->mpctx,
+        .log = args->log,
         .last_error_str = talloc_strdup(ctx, "Cannot initialize JavaScript"),
-        .filename = fname,
+        .filename = args->filename,
+        .path = args->path,
     };
 
     int r = -1;
@@ -561,9 +563,10 @@ static void script__request_event(js_State *J)
 static void script_enable_messages(js_State *J)
 {
     const char *level = js_tostring(J, 1);
-    if (mp_msg_find_level(level) < 0)
+    int e = mpv_request_log_messages(jclient(J), level);
+    if (e == MPV_ERROR_INVALID_PARAMETER)
         js_error(J, "Invalid log level '%s'", level);
-    push_status(J, mpv_request_log_messages(jclient(J), level));
+    push_status(J, e);
 }
 
 // args - command [with arguments] as string
@@ -731,17 +734,6 @@ static void script_get_time_ms(js_State *J)
     js_pushnumber(J, mpv_get_time_us(jclient(J)) / (double)(1000));
 }
 
-static void script_set_osd_ass(js_State *J)
-{
-    struct script_ctx *ctx = jctx(J);
-    int res_x = jsL_checkint(J, 1);
-    int res_y = jsL_checkint(J, 2);
-    const char *text = js_tostring(J, 3);
-    osd_set_external(ctx->mpctx->osd, ctx->client, res_x, res_y, (char *)text);
-    mp_wakeup_core(ctx->mpctx);
-    push_success(J);
-}
-
 // push object with properties names (NULL terminated) with respective vals
 static void push_nums_obj(js_State *J, const char * const names[],
                           const double vals[])
@@ -751,25 +743,6 @@ static void push_nums_obj(js_State *J, const char * const names[],
         js_pushnumber(J, vals[i]);
         js_setproperty(J, -2, names[i]);
     }
-}
-
-// args: none, return: object with properties width, height, aspect
-static void script_get_osd_size(js_State *J)
-{
-    struct mp_osd_res r = osd_get_vo_res(jctx(J)->mpctx->osd);
-    double ar = 1.0 * r.w / MPMAX(r.h, 1) / (r.display_par ? r.display_par : 1);
-    const char * const names[] = {"width", "height", "aspect", NULL};
-    const double vals[] = {r.w, r.h, ar};
-    push_nums_obj(J, names, vals);
-}
-
-// args: none, return: object with properties top, bottom, left, right
-static void script_get_osd_margins(js_State *J)
-{
-    struct mp_osd_res r = osd_get_vo_res(jctx(J)->mpctx->osd);
-    const char * const names[] = {"left", "top", "right", "bottom", NULL};
-    const double vals[] = {r.ml, r.mt, r.mr, r.mb};
-    push_nums_obj(J, names, vals);
 }
 
 // args: none, return: object with properties x, y
@@ -1111,109 +1084,14 @@ static void makenode(void *ta_ctx, mpv_node *dst, js_State *J, int idx)
 }
 
 // args: wait in secs (infinite if negative) if mpv doesn't send events earlier.
-static void script_wait_event(js_State *J)
+static void script_wait_event(js_State *J, void *af)
 {
-    int top = js_gettop(J);
     double timeout = js_isnumber(J, 1) ? js_tonumber(J, 1) : -1;
     mpv_event *event = mpv_wait_event(jclient(J), timeout);
 
-    js_newobject(J); // the reply
-    js_pushstring(J, mpv_event_name(event->event_id));
-    js_setproperty(J, -2, "event");  // reply.event (is an event name)
-
-    if (event->reply_userdata) {
-        js_pushnumber(J, event->reply_userdata);
-        js_setproperty(J, -2, "id");   // reply.id
-    }
-
-    if (event->error < 0) {
-        // TODO: untested
-        js_pushstring(J, mpv_error_string(event->error));
-        js_setproperty(J, -2, "error");  // reply.error
-    }
-
-    switch (event->event_id) {
-    case MPV_EVENT_LOG_MESSAGE: {
-        mpv_event_log_message *msg = event->data;
-
-        js_pushstring(J, msg->prefix);
-        js_setproperty(J, -2, "prefix");  // reply.prefix (e.g. "cplayer")
-        js_pushstring(J, msg->level);
-        js_setproperty(J, -2, "level");  // reply.level (e.g. "v" or "info")
-        js_pushstring(J, msg->text);
-        js_setproperty(J, -2, "text");  // reply.text
-        break;
-    }
-
-    case MPV_EVENT_CLIENT_MESSAGE: {
-        mpv_event_client_message *msg = event->data;
-
-        js_newarray(J);  // reply.args
-        for (int n = 0; n < msg->num_args; n++) {
-            js_pushstring(J, msg->args[n]);
-            js_setindex(J, -2, n);
-        }
-        js_setproperty(J, -2, "args");  // reply.args (is a strings array)
-        break;
-    }
-
-    case MPV_EVENT_END_FILE: {
-        mpv_event_end_file *eef = event->data;
-        const char *reason;
-
-        switch (eef->reason) {
-        case MPV_END_FILE_REASON_EOF: reason = "eof"; break;
-        case MPV_END_FILE_REASON_STOP: reason = "stop"; break;
-        case MPV_END_FILE_REASON_QUIT: reason = "quit"; break;
-        case MPV_END_FILE_REASON_ERROR: reason = "error"; break;
-        case MPV_END_FILE_REASON_REDIRECT: reason = "redirect"; break;
-        default:
-            reason = "unknown";
-        }
-        js_pushstring(J, reason);
-        js_setproperty(J, -2, "reason");  // reply.reason
-
-        if (eef->reason == MPV_END_FILE_REASON_ERROR) {
-            js_pushstring(J, mpv_error_string(eef->error));
-            js_setproperty(J, -2, "error");  // reply.error
-        }
-        break;
-    }
-
-    case MPV_EVENT_PROPERTY_CHANGE: {
-        mpv_event_property *prop = event->data;
-        js_pushstring(J, prop->name);
-        js_setproperty(J, -2, "name");  // reply.name (is a property name)
-
-        switch (prop->format) {
-        case MPV_FORMAT_NODE:   pushnode(J, prop->data); break;
-        case MPV_FORMAT_DOUBLE: js_pushnumber(J, *(double *)prop->data); break;
-        case MPV_FORMAT_INT64:  js_pushnumber(J, *(int64_t *)prop->data); break;
-        case MPV_FORMAT_FLAG:   js_pushboolean(J, *(int *)prop->data); break;
-        case MPV_FORMAT_STRING: js_pushstring(J, *(char **)prop->data); break;
-        default:
-            js_pushnull(J);  // also for FORMAT_NONE, e.g. observe type "none"
-        }
-        js_setproperty(J, -2, "data");  // reply.data (value as observed type)
-        break;
-    }
-
-    case MPV_EVENT_HOOK: {
-        mpv_event_hook *hook = event->data;
-        js_pushnumber(J, hook->id);
-        js_setproperty(J, -2, "hook_id");  // reply.hook_id (is a number)
-        break;
-    }
-
-    case MPV_EVENT_COMMAND_REPLY: {
-        mpv_event_command *cmd = event->data;
-        pushnode(J, &cmd->result);
-        js_setproperty(J, -2, "result");  // reply.result (mpv node)
-        break;
-    }
-    }  // switch (event->event_id)
-
-    assert(top == js_gettop(J) - 1);
+    mpv_node *rn = new_af_mpv_node(af);
+    mpv_event_to_node(rn, event);
+    pushnode(J, rn);
 }
 
 /**********************************************************************
@@ -1232,7 +1110,7 @@ struct fn_entry {
 // FN_ENTRY is a normal js C function, AF_ENTRY is an autofree js C function.
 static const struct fn_entry main_fns[] = {
     FN_ENTRY(log, 1),
-    FN_ENTRY(wait_event, 1),
+    AF_ENTRY(wait_event, 1),
     FN_ENTRY(_request_event, 2),
     AF_ENTRY(find_config_file, 1),
     FN_ENTRY(command, 1),
@@ -1257,9 +1135,6 @@ static const struct fn_entry main_fns[] = {
     FN_ENTRY(get_wakeup_pipe, 0),
     FN_ENTRY(_hook_add, 3),
     FN_ENTRY(_hook_continue, 1),
-    FN_ENTRY(set_osd_ass, 3),
-    FN_ENTRY(get_osd_size, 0),
-    FN_ENTRY(get_osd_margins, 0),
     FN_ENTRY(get_mouse_pos, 0),
     FN_ENTRY(input_set_section_mouse_area, 5),
     FN_ENTRY(last_error, 0),
@@ -1312,6 +1187,11 @@ static void add_functions(js_State *J, struct script_ctx *ctx)
 
     js_pushstring(J, ctx->filename);
     js_setproperty(J, -2, "script_file");
+
+    if (ctx->path) {
+        js_pushstring(J, ctx->path);
+        js_setproperty(J, -2, "script_path");
+    }
 
     js_pop(J, 2);  // leave the stack as we got it
 }

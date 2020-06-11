@@ -87,6 +87,9 @@ static void select_format(struct ao *ao, const AVCodec *codec)
 static void on_ready(void *ptr)
 {
     struct ao *ao = ptr;
+    struct priv *ac = ao->priv;
+
+    ac->worst_time_base = encoder_get_mux_timebase_unlocked(ac->enc);
 
     ao_add_events(ao, AO_EVENT_INITIAL_UNBLOCK);
 }
@@ -146,14 +149,15 @@ static int init(struct ao *ao)
     // enough frames for at least 0.25 seconds
     ac->framecount = ceil(ao->samplerate * 0.25 / ac->aframesize);
     // but at least one!
-    ac->framecount = FFMAX(ac->framecount, 1);
+    ac->framecount = MPMAX(ac->framecount, 1);
 
     ac->savepts = AV_NOPTS_VALUE;
     ac->lastpts = AV_NOPTS_VALUE;
 
     ao->untimed = true;
 
-    ao->period_size = ac->aframesize * ac->framecount;
+    ao->device_buffer = ac->aframesize * ac->framecount;
+    ao->period_size = ao->device_buffer;
 
     if (ao->channels.num > AV_NUM_DATA_POINTERS)
         goto fail;
@@ -183,14 +187,6 @@ static void uninit(struct ao *ao)
         outpts += encoder_get_offset(ac->enc);
         encode(ao, outpts, NULL);
     }
-}
-
-// return: how many samples can be played without blocking
-static int get_space(struct ao *ao)
-{
-    struct priv *ac = ao->priv;
-
-    return ac->aframesize * ac->framecount;
 }
 
 // must get exactly ac->aframesize amount of data
@@ -225,14 +221,16 @@ static void encode(struct ao *ao, double apts, void **data)
 
         int64_t frame_pts = av_rescale_q(frame->pts, encoder->time_base,
                                          ac->worst_time_base);
-        if (ac->lastpts != AV_NOPTS_VALUE && frame_pts <= ac->lastpts) {
-            // this indicates broken video
-            // (video pts failing to increase fast enough to match audio)
+        while (ac->lastpts != AV_NOPTS_VALUE && frame_pts <= ac->lastpts) {
+            // whatever the fuck this code does?
             MP_WARN(ao, "audio frame pts went backwards (%d <- %d), autofixed\n",
                     (int)frame->pts, (int)ac->lastpts);
             frame_pts = ac->lastpts + 1;
+            ac->lastpts = frame_pts;
             frame->pts = av_rescale_q(frame_pts, ac->worst_time_base,
                                       encoder->time_base);
+            frame_pts = av_rescale_q(frame->pts, encoder->time_base,
+                                     ac->worst_time_base);
         }
         ac->lastpts = frame_pts;
 
@@ -244,9 +242,9 @@ static void encode(struct ao *ao, double apts, void **data)
     }
 }
 
-// this should round samples down to frame sizes
-// return: number of samples played
-static int play(struct ao *ao, void **data, int samples, int flags)
+// Note: currently relies on samples aligned to period sizes - will not work
+//       in the future.
+static bool audio_write(struct ao *ao, void **data, int samples)
 {
     struct priv *ac = ao->priv;
     struct encoder_context *enc = ac->enc;
@@ -266,7 +264,7 @@ static int play(struct ao *ao, void **data, int samples, int flags)
     void *tempdata = NULL;
     void *padded[MP_NUM_CHANNELS];
 
-    if ((flags & AOPLAY_FINAL_CHUNK) && (samples % ac->aframesize)) {
+    if (samples % ac->aframesize) {
        tempdata = talloc_new(NULL);
        size_t bytelen = samples * ao->sstride;
        size_t extralen = (ac->aframesize - 1) * ao->sstride;
@@ -277,6 +275,7 @@ static int play(struct ao *ao, void **data, int samples, int flags)
        }
        data = padded;
        samples = (bytelen + extralen) / ao->sstride;
+       MP_VERBOSE(ao, "padding final frame with silence\n");
     }
 
     double outpts = pts;
@@ -324,25 +323,33 @@ static int play(struct ao *ao, void **data, int samples, int flags)
 
     talloc_free(tempdata);
 
-    int taken = FFMIN(bufpos, orig_samples);
+    int taken = MPMIN(bufpos, orig_samples);
     ectx->samples_since_last_pts += taken;
 
     pthread_mutex_unlock(&ectx->lock);
 
-    if (flags & AOPLAY_FINAL_CHUNK) {
-        if (bufpos < orig_samples)
-            MP_ERR(ao, "did not write enough data at the end\n");
-    } else {
-        if (bufpos > orig_samples)
-            MP_ERR(ao, "audio buffer overflow (should never happen)\n");
-    }
-
-    return taken;
+    return true;
 }
 
-static void drain(struct ao *ao)
+static void get_state(struct ao *ao, struct mp_pcm_state *state)
 {
-    // pretend we support it, so generic code doesn't force a wait
+    state->free_samples = ao->device_buffer;
+    state->queued_samples = 0;
+    state->delay = 0;
+}
+
+static bool set_pause(struct ao *ao, bool paused)
+{
+    return true; // signal support so common code doesn't write silence
+}
+
+static void start(struct ao *ao)
+{
+    // we use data immediately
+}
+
+static void reset(struct ao *ao)
+{
 }
 
 const struct ao_driver audio_out_lavc = {
@@ -353,9 +360,11 @@ const struct ao_driver audio_out_lavc = {
     .priv_size = sizeof(struct priv),
     .init      = init,
     .uninit    = uninit,
-    .get_space = get_space,
-    .play      = play,
-    .drain     = drain,
+    .get_state = get_state,
+    .set_pause = set_pause,
+    .write     = audio_write,
+    .start     = start,
+    .reset     = reset,
 };
 
 // vim: sw=4 ts=4 et tw=80

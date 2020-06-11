@@ -65,16 +65,16 @@ const struct m_opt_choice_alternatives mp_image_writer_formats[] = {
 #define OPT_BASE_STRUCT struct image_writer_opts
 
 const struct m_option image_writer_opts[] = {
-    OPT_CHOICE_C("format", format, 0, mp_image_writer_formats),
-    OPT_INTRANGE("jpeg-quality", jpeg_quality, 0, 0, 100),
-    OPT_FLAG("jpeg-source-chroma", jpeg_source_chroma, 0),
-    OPT_INTRANGE("png-compression", png_compression, 0, 0, 9),
-    OPT_INTRANGE("png-filter", png_filter, 0, 0, 5),
-    OPT_FLAG("webp-lossless", webp_lossless, 0),
-    OPT_INTRANGE("webp-quality", webp_quality, 0, 0, 100),
-    OPT_INTRANGE("webp-compression", webp_compression, 0, 0, 6),
-    OPT_FLAG("high-bit-depth", high_bit_depth, 0),
-    OPT_FLAG("tag-colorspace", tag_csp, 0),
+    {"format", OPT_CHOICE_C(format, mp_image_writer_formats)},
+    {"jpeg-quality", OPT_INT(jpeg_quality), M_RANGE(0, 100)},
+    {"jpeg-source-chroma", OPT_FLAG(jpeg_source_chroma)},
+    {"png-compression", OPT_INT(png_compression), M_RANGE(0, 9)},
+    {"png-filter", OPT_INT(png_filter), M_RANGE(0, 5)},
+    {"webp-lossless", OPT_FLAG(webp_lossless)},
+    {"webp-quality", OPT_INT(webp_quality), M_RANGE(0, 100)},
+    {"webp-compression", OPT_INT(webp_compression), M_RANGE(0, 6)},
+    {"high-bit-depth", OPT_FLAG(high_bit_depth)},
+    {"tag-colorspace", OPT_FLAG(tag_csp)},
     {0},
 };
 
@@ -259,9 +259,17 @@ static int get_encoder_format(struct AVCodec *codec, int srcfmt, bool highdepth)
         int fmt = pixfmt2imgfmt(pix_fmts[n]);
         if (!fmt)
             continue;
-        // Ignore formats larger than 8 bit per pixel.
-        if (!highdepth && IMGFMT_RGB_DEPTH(fmt) > 32)
-            continue;
+        if (!highdepth) {
+            // Ignore formats larger than 8 bit per pixel. (Or which are unknown.)
+            struct mp_regular_imgfmt rdesc;
+            if (!mp_get_regular_imgfmt(&rdesc, fmt)) {
+                int ofmt = mp_find_other_endian(fmt);
+                if (!mp_get_regular_imgfmt(&rdesc, ofmt))
+                    continue;
+            }
+            if (rdesc.component_size > 1)
+                continue;
+        }
         current = current ? mp_imgfmt_select_best(current, fmt, srcfmt) : fmt;
     }
     return current;
@@ -314,6 +322,7 @@ int image_writer_format_from_ext(const char *ext)
 
 static struct mp_image *convert_image(struct mp_image *image, int destfmt,
                                       enum mp_csp_levels yuv_levels,
+                                      struct mpv_global *global,
                                       struct mp_log *log)
 {
     int d_w, d_h;
@@ -350,7 +359,14 @@ static struct mp_image *convert_image(struct mp_image *image, int destfmt,
 
     dst->params = p;
 
-    if (mp_image_swscale(dst, image, mp_sws_hq_flags) < 0) {
+    struct mp_sws_context *sws = mp_sws_alloc(NULL);
+    sws->log = log;
+    if (global)
+        mp_sws_enable_cmdline_opts(sws, global);
+    bool ok = mp_sws_scale(sws, dst, image) >= 0;
+    talloc_free(sws);
+
+    if (!ok) {
         mp_err(log, "Error when converting image.\n");
         talloc_free(dst);
         return NULL;
@@ -360,7 +376,8 @@ static struct mp_image *convert_image(struct mp_image *image, int destfmt,
 }
 
 bool write_image(struct mp_image *image, const struct image_writer_opts *opts,
-                const char *filename, struct mp_log *log)
+                const char *filename, struct mpv_global *global,
+                 struct mp_log *log)
 {
     struct image_writer_opts defs = image_writer_opts_defaults;
     if (!opts)
@@ -393,7 +410,7 @@ bool write_image(struct mp_image *image, const struct image_writer_opts *opts,
         levels = MP_CSP_LEVELS_PC;
     }
 
-    struct mp_image *dst = convert_image(image, destfmt, levels, log);
+    struct mp_image *dst = convert_image(image, destfmt, levels, global, log);
     if (!dst)
         return false;
 
@@ -416,5 +433,5 @@ void dump_png(struct mp_image *image, const char *filename, struct mp_log *log)
 {
     struct image_writer_opts opts = image_writer_opts_defaults;
     opts.format = AV_CODEC_ID_PNG;
-    write_image(image, &opts, filename, log);
+    write_image(image, &opts, filename, NULL, log);
 }

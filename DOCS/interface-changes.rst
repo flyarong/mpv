@@ -17,13 +17,127 @@ a large part of the user interface and APIs.
 
 Also see compatibility.rst.
 
-This document lists changes to them. New changes are added to the top.
+This document lists changes to them. New changes are added to the top. Usually,
+only incompatible or important changes are mentioned. New options/commands/etc.
+are not always listed.
 
 Interface changes
 =================
 
 ::
 
+ --- mpv 0.33.0 ---
+    - add `--d3d11-exclusive-fs` flag to enable D3D11 exclusive fullscreen mode
+      when the player enters fullscreen.
+    - directories in ~/.mpv/scripts/ (or equivalent) now have special semantics
+      (see mpv Lua scripting docs)
+    - names starting with "." in ~/.mpv/scripts/ (or equivalent) are now ignored
+    - js modules: ~~/scripts/modules.js/ is no longer used, global paths can be
+      set with custom init (see docs), dir-scripts first look at <dir>/modules/
+    - the OSX bundle now logs to "~/Library/Logs/mpv.log" by default
+    - deprecate the --cache-secs option (once removed, the cache cannot be
+      limited by time anymore)
+    - remove deprecated legacy hook API ("hook-add", "hook-ack"). Use either the
+      libmpv API (mpv_hook_add(), mpv_hook_continue()), or the Lua scripting
+      wrappers (mp.add_hook()).
+    - improve how property change notifications are delivered on events and on
+      hooks. In particular, a hook event is only returned to a client after all
+      changes initiated before the hook point were delivered to the same client.
+      In addition, it should no longer happen that events and property change
+      notifications were interleaved in bad ways (it could happen that a
+      property notification delivered after an event contained a value that was
+      valid only before the event happened).
+    - the playlist-pos and playlist-pos-1 properties now can return and accept
+      -1, and are never unavailable. Out of range indexes are now accepted, but
+      behave like writing -1.
+    - the playlist-pos and playlist-pos-1 properties deprecate the current
+      behavior when writing back the current value to the property: currently,
+      this restarts playback, but in the future, it will do nothing.
+      Using the "playlist-play-index" command is recommended instead.
+    - add "playlist-play-index" command
+    - add playlist-current-pos, playlist-playing-pos properties
+    - Lua end-file events set the "error" field; this is deprecated; use the
+      "file_error" instead for this specific event. Scripts relying on the
+      "error" field for end-file will silently break at some point in the
+      future.
+    - deprecate encoding mode (lack of maintainer)
+    - remove deprecated --input-file option, add --input-ipc-client, which is
+      vaguely a replacement of the removed option, but not the same
+    - change another detail for track selection options (see --aid manpage
+      entry)
+    - reading loop-file property as native property or mpv_node will now return
+      "inf" instead of boolean true (also affects loop option)
+    - remove some --vo-direct3d-... options (it got dumbed down; use --vo=gpu)
+    - remove video-params/plane-depth property (was too vaguely defined)
+    - remove --video-sync-adrop-size option (implementation was changed, no
+      replacement for what this option did)
+    - undeprecate --video-sync=display-adrop
+ --- mpv 0.32.0 ---
+    - change behavior when using legacy option syntax with options that start
+      with two dashes (``--`` instead of a ``-``). Now, using the recommended
+      syntax is required for options starting with ``--``, which means an option
+      value must be strictly passed after a ``=``, instead of as separate
+      argument. For example, ``--log-file f.txt`` was previously accepted and
+      behaved like ``--log-file=f.txt``, but now causes an error. Use of legacy
+      syntax that is still supported now prints a deprecation warning.
+ --- mpv 0.31.0 ---
+    - add `--resume-playback-check-mtime` to check consistent mtime when
+      restoring playback state.
+    - add `--d3d11-output-csp` to enable explicit selection of a D3D11
+      swap chain color space.
+    - the --sws- options and similar now affect vo_image and screenshot
+      conversion (does not matter as much for vo_gpu, which does most of this
+      with shaders)
+    - add a builtin "sw-fast" profile, which restores performance settings
+      for software video conversion. These were switched to higher quality since
+      mpv 0.30.0 (related to the previous changelog entry). This affects video
+      outputs like vo_x11 and vo_drm, and screenshots, but not much else.
+    - deprecate --input-file (there are no plans to remove this short-term,
+      but it will probably eventually go away <- that was a lie)
+    - deprecate --video-sync=display-adrop (might be removed if it's in the way;
+      undeprecated or readded if it's not too much of a problem)
+    - deprecate all input section commands (these will be changed/removed, as
+      soon as mpv internals do not require them anymore)
+    - remove deprecated --playlist-pos alias (use --playlist-start)
+    - deprecate --display-fps, introduce --override-display-fps. The display-fps
+      property now is unavailable if no VO exists (or the VO did not return a
+      display FPS), instead of returning the option value in this case. The
+      property will keep existing, but writing to it is deprecated.
+    - the vf/af properties now do not reject the set value anymore, even if
+      filter chain initialization fails. Instead, the vf/af options are always
+      set to the user's value, even if it does not reflect the "runtime" vf/af
+      chain.
+    - the vid/aid/sid/secondary-sid properties (and their aliases: "audio",
+      "video", "sub") will now allow setting any track ID; before this change,
+      only IDs of actually existing tracks could be set (the restriction was
+      active the MPV_EVENT_FILE_LOADED/"file-loaded" event was sent). Setting
+      an ID for which no track exists is equivalent to disabling it. Note that
+      setting the properties to non-existing tracks may report it as selected
+      track for a small time window, until it's forced back to "no". The exact
+      details how this is handled may change in the future.
+    - remove old Apple Remote support, including --input-appleremote
+    - add MediaPlayer support and remove the old Media Key event tap on macOS.
+      this possibly also re-adds the Apple Remote support
+    - the "edition" property now strictly returns the value of the option,
+      instead of the runtime value. The new "current-edition" property needs to
+      be queried to read the runtime-chosen edition. This is a breaking change
+      for any users which expected "edition" to return the runtime-chosen
+      edition at default settings (--edition=auto).
+    - the "window-scale" property now strictly returns the value of the option,
+      instead of the actual size of the window. The new "current-window-scale"
+      property needs to be queried to read the value as indicated by the current
+      window size. This is a breaking change.
+    - explicitly deprecate passing more than 1 item to "-add" suffix in key/value
+      options (for example --script-opts-add). This was actually always
+      deprecated, like with other list options, but the option parser did not
+      print a warning in this particular case.
+    - deprecate -del for list options (use -remove instead, which is by content
+      instead of by integer index)
+    - if `--fs` is used but `--fs-screen` is not set, mpv will now use `--screen`
+      instead.
+    - change the default of --hwdec to "no" on RPI. The default used to be "mmal"
+      specifically if 'Raspberry Pi support' was enabled at configure time
+      (equivalent to --enable-rpi). Use --hwdec=mmal to get the old behavior.
  --- mpv 0.30.0 ---
     - add `--d3d11-output-format` to enable explicit selection of a D3D11
       swap chain format.
@@ -191,6 +305,9 @@ Interface changes
       internal counter that remembered the current position.
     - remove deprecated ao/vo auto profiles. Consider using scripts like
       auto-profiles.lua instead.
+    - --[c]scale-[w]param[1|2] and --tone-mapping-param now accept "default",
+      and if set to that value, reading them as property will also return
+      "default", instead of float nan as in previous versions
  --- mpv 0.28.0 ---
     - rename --hwdec=mediacodec option to mediacodec-copy, to reflect
       conventions followed by other hardware video decoding APIs

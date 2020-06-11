@@ -46,6 +46,11 @@
 
 #define USE_MASTER 0
 
+#ifndef EGL_EXT_platform_base
+typedef EGLDisplay (EGLAPIENTRYP PFNEGLGETPLATFORMDISPLAYEXTPROC)
+    (EGLenum platform, void *native_display, const EGLint *attrib_list);
+#endif
+
 struct framebuffer
 {
     int fd;
@@ -459,6 +464,7 @@ static void queue_flip(struct ra_ctx *ctx, struct gbm_frame *frame)
     data->vsync = &p->vsync;
     data->vsync_info = &p->vsync_info;
     data->waiting_for_flip = &p->waiting_for_flip;
+    data->log = ctx->log;
 
     if (atomic_ctx) {
         drm_object_set_property(atomic_ctx->request, atomic_ctx->draw_plane, "FB_ID", p->fb->id);

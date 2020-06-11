@@ -179,11 +179,12 @@ Configurable Options
 ``seekbarkeyframes``
     Default: yes
 
-    Controls the mode used to seek when dragging the seekbar. By default,
-    keyframes are used. If set to false, exact seeking on mouse drags
-    will be used instead. Keyframes are preferred, but exact seeks may be
-    useful in cases where keyframes cannot be found. Note that using exact
-    seeks can potentially make mouse dragging much slower.
+    Controls the mode used to seek when dragging the seekbar (default: true). If
+    set to true, default seeking mode is used (usually keyframes, but player
+    defaults and heuristics can change it to exact). If set to false, exact
+    seeking on mouse drags will be used instead. Keyframes are preferred, but
+    exact seeks may be useful in cases where keyframes cannot be found. Note
+    that using exact seeks can potentially make mouse dragging much slower.
 
 ``seekrangestyle``
     Default: inverted
@@ -330,8 +331,10 @@ Configurable Options
     user has set them. (It will not overwrite them if all of them are set to
     default values.)
 
-    Currently, this is supported for the ``bottombar`` layout only. The other
-    layouts do not change if this option is set.
+    Currently, this is supported for the ``bottombar`` and ``topbar`` layout
+    only. The other layouts do not change if this option is set. Separately,
+    if window controls are present (see below), they will be affected
+    regardless of which osc layout is in use.
 
     The border is static and appears even if the OSC is configured to appear
     only on mouse interaction. If the OSC is invisible, the border is simply
@@ -340,6 +343,36 @@ Configurable Options
     This currently still makes the OSC overlap with subtitles (if the
     ``--sub-use-margins`` option is set to ``yes``, the default). This may be
     fixed later.
+
+    This does not work correctly with video outputs like ``--vo=xv``, which
+    render OSD into the unscaled video.
+
+``windowcontrols``
+    Default: auto (Show window controls if there is no window border)
+
+    Whether to show window management controls over the video, and if so,
+    which side of the window to place them. This may be desirable when the
+    window has no decorations, either because they have been explicitly
+    disabled (``border=no``) or because the current platform doesn't support
+    them (eg: gnome-shell with wayland).
+
+    The set of window controls is fixed, offering ``minimize``, ``maximize``,
+    and ``quit``. Not all platforms implement ``minimize`` and ``maximize``,
+    but ``quit`` will always work.
+
+``windowcontrols_alignment``
+    Default: right
+
+    If window controls are shown, indicates which side should they be aligned
+    to.
+
+    Supports ``left`` and ``right`` which will place the controls on those
+    respective sides.
+
+``greenandgrumpy``
+    Default: no
+
+    Set to ``yes`` to reduce festivity (i.e. disable santa hat in December.)
 
 Script Commands
 ~~~~~~~~~~~~~~~

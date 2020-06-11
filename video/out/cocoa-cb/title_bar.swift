@@ -96,6 +96,8 @@ class TitleBar: NSVisualEffectView {
                 window?.zoom(self)
             }
         }
+
+        cocoaCB.window?.isMoving = false
     }
 
     func set(appearance: Any) {
@@ -199,7 +201,11 @@ class TitleBar: NSVisualEffectView {
                 return NSAppearance(named: .accessibilityHighContrastVibrantDark)
             case "0", "auto": fallthrough
             default:
+#if HAVE_MACOS_10_14_FEATURES
                 return nil
+#else
+                break
+#endif
             }
         }
 

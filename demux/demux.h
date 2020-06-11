@@ -47,6 +47,7 @@ struct demux_reader_state {
     int64_t file_cache_bytes;
     double seeking; // current low level seek target, or NOPTS
     int low_level_seeks; // number of started low level seeks
+    uint64_t byte_level_seeks; // number of byte stream level seeks
     double ts_last; // approx. timestamp of demuxer position
     uint64_t bytes_per_second; // low level statistics
     // Positions that can be seeked to without incurring the latency of a low
@@ -62,6 +63,8 @@ struct demux_reader_state {
 #define SEEK_SATAN    (1 << 4)      // enable backward demuxing
 #define SEEK_HR       (1 << 5)      // hr-seek (this is a weak hint only)
 #define SEEK_FORCE    (1 << 6)      // ignore unseekable flag
+#define SEEK_BLOCK    (1 << 7)      // upon successfully queued seek, block readers
+                                    // (simplifies syncing multiple reader threads)
 
 // Strictness of the demuxer open format check.
 // demux.c will try by default: NORMAL, UNSAFE (in this order)
@@ -96,6 +99,9 @@ struct timeline;
 typedef struct demuxer_desc {
     const char *name;      // Demuxer name, used with -demuxer switch
     const char *desc;      // Displayed to user
+
+    // If non-NULL, these are added to the global option list.
+    const struct m_sub_options *options;
 
     // Return 0 on success, otherwise -1
     int (*open)(struct demuxer *demuxer, enum demux_check check);
@@ -196,6 +202,7 @@ typedef struct demuxer {
     bool fully_read;
     bool is_network; // opened directly from a network stream
     bool is_streaming; // implies a "slow" input, such as network or FUSE
+    int stream_origin; // any STREAM_ORIGIN_* (set from source stream)
     bool access_references; // allow opening other files/URLs
 
     // Bitmask of DEMUX_EVENT_*
@@ -246,6 +253,8 @@ bool demux_free_async_finish(struct demux_free_async_state *state);
 void demuxer_feed_caption(struct sh_stream *stream, demux_packet_t *dp);
 
 int demux_read_packet_async(struct sh_stream *sh, struct demux_packet **out_pkt);
+int demux_read_packet_async_until(struct sh_stream *sh, double min_pts,
+                                  struct demux_packet **out_pkt);
 bool demux_stream_is_selected(struct sh_stream *stream);
 void demux_set_stream_wakeup_cb(struct sh_stream *sh,
                                 void (*cb)(void *ctx), void *ctx);

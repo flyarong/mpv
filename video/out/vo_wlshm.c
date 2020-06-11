@@ -112,8 +112,7 @@ static struct buffer *buffer_create(struct vo *vo, int width, int height)
     buf->vo = vo;
     buf->size = size;
     mp_image_set_params(&buf->mpi, &p->sws->dst);
-    buf->mpi.w = width;
-    buf->mpi.h = height;
+    mp_image_set_size(&buf->mpi, width, height);
     buf->mpi.planes[0] = data;
     buf->mpi.stride[0] = stride;
     buf->pool = wl_shm_create_pool(wl->shm, fd, size);
@@ -148,6 +147,8 @@ static int preinit(struct vo *vo)
     if (!vo_wayland_init(vo))
         return -1;
     p->sws = mp_sws_alloc(vo);
+    p->sws->log = vo->log;
+    mp_sws_enable_cmdline_opts(p->sws, vo->global);
 
     return 0;
 }
@@ -163,7 +164,6 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
 
     if (!vo_wayland_reconfig(vo))
         return -1;
-    mp_sws_set_from_cmdline(p->sws, vo->global);
     p->sws->src = *params;
 
     return 0;
@@ -284,7 +284,7 @@ static const m_option_t options[] = {
 };
 
 const struct vo_driver video_out_wlshm = {
-    .description = "Wayland SHM video output",
+    .description = "Wayland SHM video output (software scaling)",
     .name = "wlshm",
     .preinit = preinit,
     .query_format = query_format,
