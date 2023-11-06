@@ -18,39 +18,31 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <unistd.h>
 #include <stdlib.h>
 #include <time.h>
-#include <sys/time.h>
-#include "config.h"
 #include "timer.h"
 
-void mp_sleep_us(int64_t us)
+void mp_sleep_ns(int64_t ns)
 {
-    if (us < 0)
+    if (ns < 0)
         return;
     struct timespec ts;
-    ts.tv_sec  =  us / 1000000;
-    ts.tv_nsec = (us % 1000000) * 1000;
+    ts.tv_sec  = ns / MP_TIME_S_TO_NS(1);
+    ts.tv_nsec = ns % MP_TIME_S_TO_NS(1);
     nanosleep(&ts, NULL);
 }
 
-#if defined(_POSIX_TIMERS) && _POSIX_TIMERS > 0 && defined(CLOCK_MONOTONIC)
-uint64_t mp_raw_time_us(void)
+uint64_t mp_raw_time_ns(void)
 {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts))
-        abort();
-    return ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
-}
-#else
-uint64_t mp_raw_time_us(void)
-{
-    struct timeval tv;
-    gettimeofday(&tv,NULL);
-    return tv.tv_sec * 1000000LL + tv.tv_usec;
-}
+    struct timespec tp = {0};
+    int ret = -1;
+#if defined(CLOCK_MONOTONIC_RAW)
+    ret = clock_gettime(CLOCK_MONOTONIC_RAW, &tp);
 #endif
+    if (ret)
+        clock_gettime(CLOCK_MONOTONIC, &tp);
+    return MP_TIME_S_TO_NS(tp.tv_sec) + tp.tv_nsec;
+}
 
 void mp_raw_time_init(void)
 {

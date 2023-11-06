@@ -17,6 +17,7 @@
  * with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,8 +28,6 @@
 #include <X11/Xutil.h>
 
 #include <libavutil/common.h>
-
-#include "config.h"
 
 #include <sys/types.h>
 #include <sys/ipc.h>
@@ -44,6 +43,7 @@
 #include "common/msg.h"
 #include "vo.h"
 #include "video/mp_image.h"
+#include "present_sync.h"
 #include "x11_common.h"
 #include "sub/osd.h"
 #include "sub/draw_bmp.h"
@@ -465,8 +465,6 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     struct xvctx *ctx = vo->priv;
     int i;
 
-    mp_image_unrefp(&ctx->original_image);
-
     ctx->image_height = params->h;
     ctx->image_width  = params->w;
     ctx->image_format = params->imgfmt;
@@ -672,7 +670,7 @@ static void wait_for_completion(struct vo *vo, int max_outstanding)
                         " for XShm completion events...\n");
                 ctx->Shm_Warned_Slow = 1;
             }
-            mp_sleep_us(1000);
+            mp_sleep_ns(MP_TIME_MS_TO_NS(1));
             vo_x11_check_events(vo);
         }
     }
@@ -688,29 +686,41 @@ static void flip_page(struct vo *vo)
 
     if (!ctx->Shmem_Flag)
         XSync(vo->x11->display, False);
+
+    if (vo->x11->use_present) {
+        vo_x11_present(vo);
+        present_sync_swap(vo->x11->present);
+    }
 }
 
-// Note: REDRAW_FRAME can call this with NULL.
-static void draw_image(struct vo *vo, mp_image_t *mpi)
+static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
+{
+    struct vo_x11_state *x11 = vo->x11;
+    if (x11->use_present)
+        present_sync_get_info(x11->present, info);
+}
+
+static void draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct xvctx *ctx = vo->priv;
 
     wait_for_completion(vo, ctx->num_buffers - 1);
+    bool render = vo_x11_check_visible(vo);
+    if (!render)
+        return;
 
     struct mp_image xv_buffer = get_xv_buffer(vo, ctx->current_buf);
-    if (mpi) {
-        mp_image_copy(&xv_buffer, mpi);
+    if (frame->current) {
+        mp_image_copy(&xv_buffer, frame->current);
     } else {
         mp_image_clear(&xv_buffer, 0, 0, xv_buffer.w, xv_buffer.h);
     }
 
     struct mp_osd_res res = osd_res_from_image_params(vo->params);
-    osd_draw_on_image(vo->osd, res, mpi ? mpi->pts : 0, 0, &xv_buffer);
+    osd_draw_on_image(vo->osd, res, frame->current ? frame->current->pts : 0, 0, &xv_buffer);
 
-    if (mpi != ctx->original_image) {
-        talloc_free(ctx->original_image);
-        ctx->original_image = mpi;
-    }
+    if (frame->current != ctx->original_image)
+        ctx->original_image = frame->current;
 }
 
 static int query_format(struct vo *vo, int format)
@@ -732,8 +742,6 @@ static void uninit(struct vo *vo)
 {
     struct xvctx *ctx = vo->priv;
     int i;
-
-    talloc_free(ctx->original_image);
 
     if (ctx->ai)
         XvFreeAdaptorInfo(ctx->ai);
@@ -857,14 +865,10 @@ static int preinit(struct vo *vo)
 
 static int control(struct vo *vo, uint32_t request, void *data)
 {
-    struct xvctx *ctx = vo->priv;
     switch (request) {
     case VOCTRL_SET_PANSCAN:
         resize(vo);
         return VO_TRUE;
-    case VOCTRL_REDRAW_FRAME:
-        draw_image(vo, ctx->original_image);
-        return true;
     }
     int events = 0;
     int r = vo_x11_control(vo, &events, request, data);
@@ -883,8 +887,9 @@ const struct vo_driver video_out_xv = {
     .query_format = query_format,
     .reconfig = reconfig,
     .control = control,
-    .draw_image = draw_image,
+    .draw_frame = draw_frame,
     .flip_page = flip_page,
+    .get_vsync = get_vsync,
     .wakeup = vo_x11_wakeup,
     .wait_events = vo_x11_wait_events,
     .uninit = uninit,
@@ -897,20 +902,19 @@ const struct vo_driver video_out_xv = {
         .cfg_buffers = 2,
     },
     .options = (const struct m_option[]) {
-        OPT_INT("port", xv_port, M_OPT_MIN, .min = 0),
-        OPT_INT("adaptor", cfg_xv_adaptor, M_OPT_MIN, .min = -1),
-        OPT_CHOICE("ck", xv_ck_info.source, 0,
-                   ({"use", CK_SRC_USE},
-                    {"set", CK_SRC_SET},
-                    {"cur", CK_SRC_CUR})),
-        OPT_CHOICE("ck-method", xv_ck_info.method, 0,
-                   ({"none", CK_METHOD_NONE},
-                    {"bg", CK_METHOD_BACKGROUND},
-                    {"man", CK_METHOD_MANUALFILL},
-                    {"auto", CK_METHOD_AUTOPAINT})),
-        OPT_INT("colorkey", colorkey, 0),
-        OPT_INTRANGE("buffers", cfg_buffers, 0, 1, MAX_BUFFERS),
-        OPT_REMOVED("no-colorkey", "use ck-method=none instead"),
+        {"port", OPT_INT(xv_port), M_RANGE(0, DBL_MAX)},
+        {"adaptor", OPT_INT(cfg_xv_adaptor), M_RANGE(-1, DBL_MAX)},
+        {"ck", OPT_CHOICE(xv_ck_info.source,
+            {"use", CK_SRC_USE},
+            {"set", CK_SRC_SET},
+            {"cur", CK_SRC_CUR})},
+        {"ck-method", OPT_CHOICE(xv_ck_info.method,
+            {"none", CK_METHOD_NONE},
+            {"bg", CK_METHOD_BACKGROUND},
+            {"man", CK_METHOD_MANUALFILL},
+            {"auto", CK_METHOD_AUTOPAINT})},
+        {"colorkey", OPT_INT(colorkey)},
+        {"buffers", OPT_INT(cfg_buffers), M_RANGE(1, MAX_BUFFERS)},
         {0}
     },
     .options_prefix = "xv",

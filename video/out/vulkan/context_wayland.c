@@ -16,6 +16,7 @@
  */
 
 #include "video/out/gpu/context.h"
+#include "video/out/present_sync.h"
 #include "video/out/wayland_common.h"
 
 #include "common.h"
@@ -26,30 +27,27 @@ struct priv {
     struct mpvk_ctx vk;
 };
 
-static const struct wl_callback_listener frame_listener;
-
-static void frame_callback(void *data, struct wl_callback *callback, uint32_t time)
+static bool wayland_vk_check_visible(struct ra_ctx *ctx)
 {
-    struct vo_wayland_state *wl = data;
-
-    if (callback)
-        wl_callback_destroy(callback);
-
-    wl->frame_callback = wl_surface_frame(wl->surface);
-    wl_callback_add_listener(wl->frame_callback, &frame_listener, wl);
-    wl->callback_wait = false;
+    return vo_wayland_check_visible(ctx->vo);
 }
-
-static const struct wl_callback_listener frame_listener = {
-    frame_callback,
-};
 
 static void wayland_vk_swap_buffers(struct ra_ctx *ctx)
 {
     struct vo_wayland_state *wl = ctx->vo->wl;
 
-    vo_wayland_wait_frame(wl);
-    wl->callback_wait = true;
+    if (!wl->opts->disable_vsync)
+        vo_wayland_wait_frame(wl);
+
+    if (wl->use_present)
+        present_sync_swap(wl->present);
+}
+
+static void wayland_vk_get_vsync(struct ra_ctx *ctx, struct vo_vsync_info *info)
+{
+    struct vo_wayland_state *wl = ctx->vo->wl;
+    if (wl->use_present)
+        present_sync_get_info(wl->present, info);
 }
 
 static void wayland_vk_uninit(struct ra_ctx *ctx)
@@ -80,7 +78,9 @@ static bool wayland_vk_init(struct ra_ctx *ctx)
     };
 
     struct ra_vk_ctx_params params = {
+        .check_visible = wayland_vk_check_visible,
         .swap_buffers = wayland_vk_swap_buffers,
+        .get_vsync = wayland_vk_get_vsync,
     };
 
     VkInstance inst = vk->vkinst->instance;
@@ -101,9 +101,6 @@ static bool wayland_vk_init(struct ra_ctx *ctx)
 
     ra_add_native_resource(ctx->ra, "wl", ctx->vo->wl->display);
 
-    ctx->vo->wl->frame_callback = wl_surface_frame(ctx->vo->wl->surface);
-    wl_callback_add_listener(ctx->vo->wl->frame_callback, &frame_listener, ctx->vo->wl);
-
     return true;
 
 error:
@@ -117,19 +114,17 @@ static bool resize(struct ra_ctx *ctx)
 
     MP_VERBOSE(wl, "Handling resize on the vk side\n");
 
-    const int32_t width = wl->scaling*mp_rect_w(wl->geometry);
-    const int32_t height = wl->scaling*mp_rect_h(wl->geometry);
+    const int32_t width = mp_rect_w(wl->geometry);
+    const int32_t height = mp_rect_h(wl->geometry);
 
-    wl_surface_set_buffer_scale(wl->surface, wl->scaling);
+    vo_wayland_set_opaque_region(wl, ctx->opts.want_alpha);
+    vo_wayland_handle_fractional_scale(wl);
     return ra_vk_ctx_resize(ctx, width, height);
 }
 
 static bool wayland_vk_reconfig(struct ra_ctx *ctx)
 {
-    if (!vo_wayland_reconfig(ctx->vo))
-        return false;
-
-    return true;
+    return vo_wayland_reconfig(ctx->vo);
 }
 
 static int wayland_vk_control(struct ra_ctx *ctx, int *events, int request, void *arg)
@@ -147,18 +142,26 @@ static void wayland_vk_wakeup(struct ra_ctx *ctx)
     vo_wayland_wakeup(ctx->vo);
 }
 
-static void wayland_vk_wait_events(struct ra_ctx *ctx, int64_t until_time_us)
+static void wayland_vk_wait_events(struct ra_ctx *ctx, int64_t until_time_ns)
 {
-    vo_wayland_wait_events(ctx->vo, until_time_us);
+    vo_wayland_wait_events(ctx->vo, until_time_ns);
+}
+
+static void wayland_vk_update_render_opts(struct ra_ctx *ctx)
+{
+    struct vo_wayland_state *wl = ctx->vo->wl;
+    vo_wayland_set_opaque_region(wl, ctx->opts.want_alpha);
+    wl_surface_commit(wl->surface);
 }
 
 const struct ra_ctx_fns ra_ctx_vulkan_wayland = {
-    .type           = "vulkan",
-    .name           = "waylandvk",
-    .reconfig       = wayland_vk_reconfig,
-    .control        = wayland_vk_control,
-    .wakeup         = wayland_vk_wakeup,
-    .wait_events    = wayland_vk_wait_events,
-    .init           = wayland_vk_init,
-    .uninit         = wayland_vk_uninit,
+    .type               = "vulkan",
+    .name               = "waylandvk",
+    .reconfig           = wayland_vk_reconfig,
+    .control            = wayland_vk_control,
+    .wakeup             = wayland_vk_wakeup,
+    .wait_events        = wayland_vk_wait_events,
+    .update_render_opts = wayland_vk_update_render_opts,
+    .init               = wayland_vk_init,
+    .uninit             = wayland_vk_uninit,
 };

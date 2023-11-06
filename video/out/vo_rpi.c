@@ -69,6 +69,7 @@ struct priv {
 
     double osd_pts;
     struct mp_osd_res osd_res;
+    struct m_config_cache *opts_cache;
 
     struct mp_egl_rpi egl;
     struct gl_video *gl_video;
@@ -83,8 +84,8 @@ struct priv {
     // for RAM input
     MMAL_POOL_T *swpool;
 
-    pthread_mutex_t display_mutex;
-    pthread_cond_t display_cond;
+    mp_mutex display_mutex;
+    mp_cond display_cond;
     int64_t vsync_counter;
     bool reload_display;
 
@@ -94,8 +95,8 @@ struct priv {
 
     int display_nr;
     int layer;
-    int background;
-    int enable_osd;
+    bool background;
+    bool enable_osd;
 };
 
 // Magic alignments (in pixels) expected by the MMAL internals.
@@ -110,7 +111,7 @@ static void *get_proc_address(const GLubyte *name)
     // EGL 1.4 (supported by the RPI firmware) does not necessarily return
     // function pointers for core functions.
     if (!p) {
-        void *h = dlopen("/opt/vc/lib/libGLESv2.so", RTLD_LAZY);
+        void *h = dlopen("/opt/vc/lib/libbrcmGLESv2.so", RTLD_LAZY);
         if (h) {
             p = dlsym(h, name);
             dlclose(h);
@@ -475,14 +476,14 @@ static int set_geometry(struct vo *vo)
 static void wait_next_vsync(struct vo *vo)
 {
     struct priv *p = vo->priv;
-    pthread_mutex_lock(&p->display_mutex);
-    struct timespec end = mp_rel_time_to_timespec(0.050);
+    mp_mutex_lock(&p->display_mutex);
+    int64_t end = mp_time_ns() + MP_TIME_MS_TO_NS(50);
     int64_t old = p->vsync_counter;
     while (old == p->vsync_counter && !p->reload_display) {
-        if (pthread_cond_timedwait(&p->display_cond, &p->display_mutex, &end))
+        if (mp_cond_timedwait_until(&p->display_cond, &p->display_mutex, end))
             break;
     }
-    pthread_mutex_unlock(&p->display_mutex);
+    mp_mutex_unlock(&p->display_mutex);
 }
 
 static void flip_page(struct vo *vo)
@@ -720,16 +721,28 @@ fail:
     return NULL;
 }
 
+static void set_fullscreen(struct vo *vo) {
+    struct priv *p = vo->priv;
+
+    if (p->renderer_enabled)
+	set_geometry(vo);
+    vo->want_redraw = true;
+}
+
 static int control(struct vo *vo, uint32_t request, void *data)
 {
     struct priv *p = vo->priv;
 
     switch (request) {
-    case VOCTRL_FULLSCREEN:
-        if (p->renderer_enabled)
-            set_geometry(vo);
-        vo->want_redraw = true;
+    case VOCTRL_VO_OPTS_CHANGED: {
+        void *opt;
+        while (m_config_cache_get_next_changed(p->opts_cache, &opt)) {
+            struct mp_vo_opts *opts = p->opts_cache->opts;
+            if (&opts->fullscreen == opt)
+                set_fullscreen(vo);
+        }
         return VO_TRUE;
+    }
     case VOCTRL_SET_PANSCAN:
         if (p->renderer_enabled)
             resize(vo);
@@ -742,16 +755,20 @@ static int control(struct vo *vo, uint32_t request, void *data)
         *(struct mp_image **)data = take_screenshot(vo);
         return VO_TRUE;
     case VOCTRL_CHECK_EVENTS: {
-        pthread_mutex_lock(&p->display_mutex);
+        mp_mutex_lock(&p->display_mutex);
         bool reload_required = p->reload_display;
         p->reload_display = false;
-        pthread_mutex_unlock(&p->display_mutex);
+        mp_mutex_unlock(&p->display_mutex);
         if (reload_required)
             recreate_renderer(vo);
         return VO_TRUE;
     }
     case VOCTRL_GET_DISPLAY_FPS:
         *(double *)data = p->display_fps;
+        return VO_TRUE;
+    case VOCTRL_GET_DISPLAY_RES:
+        ((int *)data)[0] = p->w;
+        ((int *)data)[1] = p->h;
         return VO_TRUE;
     }
 
@@ -763,10 +780,10 @@ static void tv_callback(void *callback_data, uint32_t reason, uint32_t param1,
 {
     struct vo *vo = callback_data;
     struct priv *p = vo->priv;
-    pthread_mutex_lock(&p->display_mutex);
+    mp_mutex_lock(&p->display_mutex);
     p->reload_display = true;
-    pthread_cond_signal(&p->display_cond);
-    pthread_mutex_unlock(&p->display_mutex);
+    mp_cond_signal(&p->display_cond);
+    mp_mutex_unlock(&p->display_mutex);
     vo_wakeup(vo);
 }
 
@@ -774,10 +791,10 @@ static void vsync_callback(DISPMANX_UPDATE_HANDLE_T u, void *arg)
 {
     struct vo *vo = arg;
     struct priv *p = vo->priv;
-    pthread_mutex_lock(&p->display_mutex);
+    mp_mutex_lock(&p->display_mutex);
     p->vsync_counter += 1;
-    pthread_cond_signal(&p->display_cond);
-    pthread_mutex_unlock(&p->display_mutex);
+    mp_cond_signal(&p->display_cond);
+    mp_mutex_unlock(&p->display_mutex);
 }
 
 static void destroy_dispmanx(struct vo *vo)
@@ -786,6 +803,10 @@ static void destroy_dispmanx(struct vo *vo)
 
     disable_renderer(vo);
     destroy_overlays(vo);
+
+    if (p->update)
+        vc_dispmanx_update_submit_sync(p->update);
+    p->update = 0;
 
     if (p->display) {
         vc_dispmanx_vsync_callback(p->display, NULL, NULL);
@@ -839,16 +860,13 @@ static void uninit(struct vo *vo)
 
     destroy_dispmanx(vo);
 
-    if (p->update)
-        vc_dispmanx_update_submit_sync(p->update);
-
     if (p->renderer)
         mmal_component_release(p->renderer);
 
     mmal_vc_deinit();
 
-    pthread_cond_destroy(&p->display_cond);
-    pthread_mutex_destroy(&p->display_mutex);
+    mp_cond_destroy(&p->display_cond);
+    mp_mutex_destroy(&p->display_mutex);
 }
 
 static int preinit(struct vo *vo)
@@ -868,8 +886,10 @@ static int preinit(struct vo *vo)
         return -1;
     }
 
-    pthread_mutex_init(&p->display_mutex, NULL);
-    pthread_cond_init(&p->display_cond, NULL);
+    mp_mutex_init(&p->display_mutex);
+    mp_cond_init(&p->display_cond);
+
+    p->opts_cache = m_config_cache_alloc(p, vo->global, &vo_sub_opts);
 
     if (recreate_dispmanx(vo) < 0)
         goto fail;
@@ -894,10 +914,10 @@ fail:
 
 #define OPT_BASE_STRUCT struct priv
 static const struct m_option options[] = {
-    OPT_INT("display", display_nr, 0),
-    OPT_INT("layer", layer, 0, OPTDEF_INT(-10)),
-    OPT_FLAG("background", background, 0),
-    OPT_FLAG("osd", enable_osd, 0, OPTDEF_INT(1)),
+    {"display", OPT_INT(display_nr)},
+    {"layer", OPT_INT(layer), OPTDEF_INT(-10)},
+    {"background", OPT_BOOL(background)},
+    {"osd", OPT_BOOL(enable_osd), OPTDEF_INT(1)},
     {0},
 };
 

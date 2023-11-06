@@ -35,10 +35,10 @@
 
 #include <X11/extensions/scrnsaver.h>
 #include <X11/extensions/dpms.h>
-#include <X11/extensions/Xinerama.h>
+#include <X11/extensions/shape.h>
+#include <X11/extensions/Xpresent.h>
 #include <X11/extensions/Xrandr.h>
 
-#include "config.h"
 #include "misc/bstr.h"
 #include "options/options.h"
 #include "options/m_config.h"
@@ -48,12 +48,14 @@
 #include "input/event.h"
 #include "video/image_loader.h"
 #include "video/mp_image.h"
+#include "present_sync.h"
 #include "x11_common.h"
 #include "mpv_talloc.h"
 
 #include "vo.h"
 #include "win_state.h"
 #include "osdep/io.h"
+#include "osdep/poll_wrapper.h"
 #include "osdep/timer.h"
 #include "osdep/subprocess.h"
 
@@ -65,6 +67,7 @@
 #define vo_wm_STAYS_ON_TOP 4
 #define vo_wm_ABOVE 8
 #define vo_wm_BELOW 16
+#define vo_wm_STICKY 32
 
 /* EWMH state actions, see
          http://freedesktop.org/Standards/wm-spec/index.html#id2768769 */
@@ -107,19 +110,19 @@ typedef struct
 } MotifWmHints;
 
 static const char x11_icon_16[] =
-#include "video/out/x11_icon_16.inc"
+#include "etc/mpv-icon-8bit-16x16.png.inc"
 ;
 
 static const char x11_icon_32[] =
-#include "video/out/x11_icon_32.inc"
+#include "etc/mpv-icon-8bit-32x32.png.inc"
 ;
 
 static const char x11_icon_64[] =
-#include "video/out/x11_icon_64.inc"
+#include "etc/mpv-icon-8bit-64x64.png.inc"
 ;
 
 static const char x11_icon_128[] =
-  #include "video/out/x11_icon_128.inc"
+#include "etc/mpv-icon-8bit-128x128.png.inc"
 ;
 
 #define ICON_ENTRY(var) { (char *)var, sizeof(var) }
@@ -134,6 +137,7 @@ static const struct bstr x11_icons[] = {
 static struct mp_log *x11_error_output;
 static atomic_int x11_error_silence;
 
+static bool rc_overlaps(struct mp_rect rc1, struct mp_rect rc2);
 static void vo_x11_update_geometry(struct vo *vo);
 static void vo_x11_fullscreen(struct vo *vo);
 static void xscreensaver_heartbeat(struct vo_x11_state *x11);
@@ -145,6 +149,10 @@ static void vo_x11_xembed_handle_message(struct vo *vo, XClientMessageEvent *ce)
 static void vo_x11_xembed_send_message(struct vo_x11_state *x11, long m[4]);
 static void vo_x11_move_resize(struct vo *vo, bool move, bool resize,
                                struct mp_rect rc);
+static void vo_x11_maximize(struct vo *vo);
+static void vo_x11_minimize(struct vo *vo);
+static void vo_x11_set_input_region(struct vo *vo, bool passthrough);
+static void vo_x11_sticky(struct vo *vo, bool sticky);
 
 #define XA(x11, s) (XInternAtom((x11)->display, # s, False))
 #define XAs(x11, s) XInternAtom((x11)->display, s, False)
@@ -205,7 +213,7 @@ static bool x11_get_property_copy(struct vo_x11_state *x11, Window w,
     void *ptr = x11_get_property(x11, w, property, type, format, &len);
     if (ptr) {
         size_t ib = format == 32 ? sizeof(long) : format / 8;
-        if (dst_size / ib >= len) {
+        if (dst_size <= len * ib) {
             memcpy(dst, ptr, dst_size);
             ret = true;
         }
@@ -244,6 +252,8 @@ static void x11_set_ewmh_state(struct vo_x11_state *x11, char *state, bool set)
     long params[5] = {
         set ? NET_WM_STATE_ADD : NET_WM_STATE_REMOVE,
         XInternAtom(x11->display, state, False),
+        0, // No second state
+        1, // source indication: normal
     };
     x11_send_ewmh_msg(x11, "_NET_WM_STATE", params);
 }
@@ -312,7 +322,7 @@ static int net_wm_support_state_test(struct vo_x11_state *x11, Atom atom)
 {
 #define NET_WM_STATE_TEST(x) { \
     if (atom == XA(x11, _NET_WM_STATE_##x)) { \
-        MP_VERBOSE(x11, "Detected wm supports " #x " state.\n" ); \
+        MP_DBG(x11, "Detected wm supports " #x " state.\n" ); \
         return vo_wm_##x; \
     } \
 }
@@ -321,6 +331,7 @@ static int net_wm_support_state_test(struct vo_x11_state *x11, Atom atom)
     NET_WM_STATE_TEST(ABOVE);
     NET_WM_STATE_TEST(STAYS_ON_TOP);
     NET_WM_STATE_TEST(BELOW);
+    NET_WM_STATE_TEST(STICKY);
     return 0;
 }
 
@@ -342,7 +353,7 @@ static int vo_wm_detect(struct vo *vo)
     if (args) {
         for (i = 0; i < nitems; i++) {
             if (args[i] == XA(x11, _WIN_LAYER)) {
-                MP_VERBOSE(x11, "Detected wm supports layers.\n");
+                MP_DBG(x11, "Detected wm supports layers.\n");
                 wm |= vo_wm_LAYER;
             }
         }
@@ -352,23 +363,36 @@ static int vo_wm_detect(struct vo *vo)
     args = x11_get_property(x11, win, XA(x11, _NET_SUPPORTED), XA_ATOM, 32,
                             &nitems);
     if (args) {
-        MP_VERBOSE(x11, "Detected wm supports NetWM.\n");
-        if (vo->opts->x11_netwm >= 0) {
+        MP_DBG(x11, "Detected wm supports NetWM.\n");
+        if (x11->opts->x11_netwm >= 0) {
             for (i = 0; i < nitems; i++)
                 wm |= net_wm_support_state_test(vo->x11, args[i]);
         } else {
-            MP_VERBOSE(x11, "NetWM usage disabled by user.\n");
+            MP_DBG(x11, "NetWM usage disabled by user.\n");
         }
         XFree(args);
     }
 
     if (wm == 0)
-        MP_VERBOSE(x11, "Unknown wm type...\n");
-    if (vo->opts->x11_netwm > 0 && !(wm & vo_wm_FULLSCREEN)) {
+        MP_DBG(x11, "Unknown wm type...\n");
+    if (x11->opts->x11_netwm > 0 && !(wm & vo_wm_FULLSCREEN)) {
         MP_WARN(x11, "Forcing NetWM FULLSCREEN support.\n");
         wm |= vo_wm_FULLSCREEN;
     }
     return wm;
+}
+
+static void xpresent_set(struct vo_x11_state *x11)
+{
+    int present = x11->opts->x11_present;
+    x11->use_present = x11->present_code &&
+                       ((x11->has_mesa && !x11->has_nvidia && present) ||
+                        present == 2);
+    if (x11->use_present) {
+        MP_VERBOSE(x11, "XPresent enabled.\n");
+    } else {
+        MP_VERBOSE(x11, "XPresent disabled.\n");
+    }
 }
 
 static void xrandr_read(struct vo_x11_state *x11)
@@ -394,6 +418,32 @@ static void xrandr_read(struct vo_x11_state *x11)
         MP_VERBOSE(x11, "Xrandr doesn't work.\n");
         return;
     }
+
+    /* Look at the available providers on the current screen and try to determine
+     * the driver. If amd/intel/radeon, assume this is mesa. If nvidia is found,
+     * assume nvidia. Because the same screen can have multiple providers (e.g.
+     * a laptop with switchable graphics), we need to know both of these things.
+     * In practice, this is used for determining whether or not to use XPresent
+     * (i.e. needs to be Mesa and not Nvidia). Requires Randr 1.4. */
+    XRRProviderResources *pr = XRRGetProviderResources(x11->display, x11->rootwin);
+    for (int i = 0; i < pr->nproviders; i++) {
+        XRRProviderInfo *info = XRRGetProviderInfo(x11->display, r, pr->providers[i]);
+        struct bstr provider_name = bstrdup(x11, bstr0(info->name));
+        bstr_lower(provider_name);
+        int amd = bstr_find0(provider_name, "amd");
+        int intel = bstr_find0(provider_name, "intel");
+        int modesetting = bstr_find0(provider_name, "modesetting");
+        int nouveau = bstr_find0(provider_name, "nouveau");
+        int nvidia = bstr_find0(provider_name, "nvidia");
+        int radeon = bstr_find0(provider_name, "radeon");
+        x11->has_mesa = x11->has_mesa || amd >= 0 || intel >= 0 ||
+                        modesetting >= 0 || nouveau >= 0 || radeon >= 0;
+        x11->has_nvidia = x11->has_nvidia || nvidia >= 0;
+        XRRFreeProviderInfo(info);
+    }
+    if (x11->present_code)
+        xpresent_set(x11);
+    XRRFreeProviderResources(pr);
 
     int primary_id = -1;
     RROutput primary = XRRGetOutputPrimary(x11->display, x11->rootwin);
@@ -442,6 +492,7 @@ static void xrandr_read(struct vo_x11_state *x11)
 
     for (int i = 0; i < x11->num_displays; i++) {
         struct xrandr_display *d = &(x11->displays[i]);
+        d->screen = i;
 
         if (i == primary_id) {
             d->atom_id = 0;
@@ -457,44 +508,81 @@ static void xrandr_read(struct vo_x11_state *x11)
     XRRFreeScreenResources(r);
 }
 
+static int vo_x11_select_screen(struct vo *vo)
+{
+    struct vo_x11_state *x11 = vo->x11;
+    struct mp_vo_opts *opts = x11->opts;
+    int screen = -2; // all displays
+    if (!opts->fullscreen || opts->fsscreen_id != -2) {
+        screen = opts->fullscreen ? opts->fsscreen_id : opts->screen_id;
+        if (opts->fullscreen && opts->fsscreen_id == -1)
+            screen = opts->screen_id;
+
+        if (screen == -1 && (opts->fsscreen_name || opts->screen_name)) {
+            char *screen_name = opts->fullscreen ? opts->fsscreen_name : opts->screen_name;
+            if (screen_name) {
+                bool screen_found = false;
+                for (int n = 0; n < x11->num_displays; n++) {
+                    char *display_name = x11->displays[n].name;
+                    if (!strcmp(display_name, screen_name)) {
+                        screen = n;
+                        screen_found = true;
+                        break;
+                    }
+                }
+                if (!screen_found)
+                    MP_WARN(x11, "Screen name %s not found!\n", screen_name);
+            }
+        }
+
+        if (screen >= x11->num_displays)
+            screen = x11->num_displays - 1;
+    }
+    return screen;
+}
+
 static void vo_x11_update_screeninfo(struct vo *vo)
 {
-    struct mp_vo_opts *opts = vo->opts;
     struct vo_x11_state *x11 = vo->x11;
-    bool all_screens = opts->fullscreen && opts->fsscreen_id == -2;
     x11->screenrc = (struct mp_rect){.x1 = x11->ws_width, .y1 = x11->ws_height};
-    if (opts->screen_id >= -1 && XineramaIsActive(x11->display) && !all_screens)
-    {
-        int screen = opts->fullscreen ? opts->fsscreen_id : opts->screen_id;
-        XineramaScreenInfo *screens;
-        int num_screens;
-
-        screens = XineramaQueryScreens(x11->display, &num_screens);
-        if (screen >= num_screens)
-            screen = num_screens - 1;
+    int screen = vo_x11_select_screen(vo);
+    if (screen >= -1) {
         if (screen == -1) {
             int x = x11->winrc.x0 + RC_W(x11->winrc) / 2;
             int y = x11->winrc.y0 + RC_H(x11->winrc) / 2;
-            for (screen = num_screens - 1; screen > 0; screen--) {
-                int left = screens[screen].x_org;
-                int right = left + screens[screen].width;
-                int top = screens[screen].y_org;
-                int bottom = top + screens[screen].height;
+            for (screen = x11->num_displays - 1; screen > 0; screen--) {
+                struct xrandr_display *disp = &x11->displays[screen];
+                int left = disp->rc.x0;
+                int right = disp->rc.x1;
+                int top = disp->rc.y0;
+                int bottom = disp->rc.y1;
                 if (left <= x && x <= right && top <= y && y <= bottom)
                     break;
             }
         }
+
         if (screen < 0)
             screen = 0;
         x11->screenrc = (struct mp_rect){
-            .x0 = screens[screen].x_org,
-            .y0 = screens[screen].y_org,
-            .x1 = screens[screen].x_org + screens[screen].width,
-            .y1 = screens[screen].y_org + screens[screen].height,
+            .x0 = x11->displays[screen].rc.x0,
+            .y0 = x11->displays[screen].rc.y0,
+            .x1 = x11->displays[screen].rc.x1,
+            .y1 = x11->displays[screen].rc.y1,
         };
-
-        XFree(screens);
     }
+}
+
+static struct xrandr_display *get_current_display(struct vo *vo)
+{
+    struct vo_x11_state *x11 = vo->x11;
+    struct xrandr_display *selected_disp = NULL;
+    for (int n = 0; n < x11->num_displays; n++) {
+        struct xrandr_display *disp = &x11->displays[n];
+        disp->overlaps = rc_overlaps(disp->rc, x11->winrc);
+        if (disp->overlaps && (!selected_disp || disp->fps < selected_disp->fps))
+            selected_disp = disp;
+    }
+    return selected_disp;
 }
 
 // Get the monitors for the 4 edges of the rectangle spanning all screens.
@@ -502,51 +590,21 @@ static void vo_x11_get_bounding_monitors(struct vo_x11_state *x11, long b[4])
 {
     //top  bottom left   right
     b[0] = b[1] = b[2] = b[3] = 0;
-    int num_screens = 0;
-    XineramaScreenInfo *screens = XineramaQueryScreens(x11->display, &num_screens);
-    if (!screens)
-        return;
-    for (int n = 0; n < num_screens; n++) {
-        XineramaScreenInfo *s = &screens[n];
-        if (s->y_org < screens[b[0]].y_org)
+    for (int n = 0; n < x11->num_displays; n++) {
+        struct xrandr_display *d = &x11->displays[n];
+        if (d->rc.y0 < x11->displays[b[0]].rc.y0)
             b[0] = n;
-        if (s->y_org + s->height > screens[b[1]].y_org + screens[b[1]].height)
+        if (d->rc.y1 < x11->displays[b[1]].rc.y1)
             b[1] = n;
-        if (s->x_org < screens[b[2]].x_org)
+        if (d->rc.x0 < x11->displays[b[2]].rc.x0)
             b[2] = n;
-        if (s->x_org + s->width > screens[b[3]].x_org + screens[b[3]].width)
+        if (d->rc.x1 < x11->displays[b[3]].rc.x1)
             b[3] = n;
     }
-    XFree(screens);
 }
 
-static void *screensaver_thread(void *arg)
+bool vo_x11_init(struct vo *vo)
 {
-    struct vo_x11_state *x11 = arg;
-
-    for (;;) {
-        sem_wait(&x11->screensaver_sem);
-        // don't queue multiple wakeups
-        while (!sem_trywait(&x11->screensaver_sem)) {}
-
-        if (atomic_load(&x11->screensaver_terminate))
-            break;
-
-        char *args[] = {"xdg-screensaver", "reset", NULL};
-        int status = mp_subprocess(args, NULL, NULL, mp_devnull, mp_devnull, &(char*){0});
-        if (status) {
-            MP_VERBOSE(x11, "Disabling screensaver failed (%d). Make sure the "
-                            "xdg-screensaver script is installed.\n", status);
-            break;
-        }
-    }
-
-    return NULL;
-}
-
-int vo_x11_init(struct vo *vo)
-{
-    struct mp_vo_opts *opts = vo->opts;
     char *dispName;
 
     assert(!vo->x11);
@@ -561,18 +619,14 @@ int vo_x11_init(struct vo *vo)
         .xrandr_event = -1,
         .wakeup_pipe = {-1, -1},
         .dpi_scale = 1,
+        .opts_cache = m_config_cache_alloc(x11, vo->global, &vo_sub_opts),
     };
+    x11->opts = x11->opts_cache->opts;
     vo->x11 = x11;
-
-    sem_init(&x11->screensaver_sem, 0, 0);
-    if (pthread_create(&x11->screensaver_thread, NULL, screensaver_thread, x11)) {
-        sem_destroy(&x11->screensaver_sem);
-        goto error;
-    }
-    x11->screensaver_thread_running = true;
 
     x11_error_output = x11->log;
     XSetErrorHandler(x11_errorhandler);
+    x11->present = talloc_zero(x11, struct mp_present);
 
     dispName = XDisplayName(NULL);
 
@@ -587,10 +641,10 @@ int vo_x11_init(struct vo *vo)
     x11->screen = DefaultScreen(x11->display);  // screen ID
     x11->rootwin = RootWindow(x11->display, x11->screen);   // root window ID
 
-    if (vo->opts->WinID >= 0)
-        x11->parent = vo->opts->WinID ? vo->opts->WinID : x11->rootwin;
+    if (x11->opts->WinID >= 0)
+        x11->parent = x11->opts->WinID ? x11->opts->WinID : x11->rootwin;
 
-    if (!opts->native_keyrepeat) {
+    if (!x11->opts->native_keyrepeat) {
         Bool ok = False;
         XkbSetDetectableAutoRepeat(x11->display, True, &ok);
         x11->no_autorepeat = ok;
@@ -609,16 +663,16 @@ int vo_x11_init(struct vo *vo)
         dispName += 9;
     x11->display_is_local = dispName[0] == ':' &&
                             strtoul(dispName + 1, NULL, 10) < 10;
-    MP_VERBOSE(x11, "X11 running at %dx%d (\"%s\" => %s display)\n",
-               x11->ws_width, x11->ws_height, dispName,
-               x11->display_is_local ? "local" : "remote");
+    MP_DBG(x11, "X11 running at %dx%d (\"%s\" => %s display)\n",
+           x11->ws_width, x11->ws_height, dispName,
+           x11->display_is_local ? "local" : "remote");
 
     int w_mm = DisplayWidthMM(x11->display, x11->screen);
     int h_mm = DisplayHeightMM(x11->display, x11->screen);
     double dpi_x = x11->ws_width * 25.4 / w_mm;
     double dpi_y = x11->ws_height * 25.4 / h_mm;
     double base_dpi = 96;
-    if (isfinite(dpi_x) && isfinite(dpi_y)) {
+    if (isfinite(dpi_x) && isfinite(dpi_y) && x11->opts->hidpi_window_scale) {
         int s_x = lrint(MPCLAMP(dpi_x / base_dpi, 0, 10));
         int s_y = lrint(MPCLAMP(dpi_y / base_dpi, 0, 10));
         if (s_x == s_y && s_x > 1 && s_x < 10) {
@@ -638,11 +692,11 @@ int vo_x11_init(struct vo *vo)
 
     vo_x11_update_geometry(vo);
 
-    return 1;
+    return true;
 
 error:
     vo_x11_uninit(vo);
-    return 0;
+    return false;
 }
 
 static const struct mp_keymap keymap[] = {
@@ -666,6 +720,10 @@ static const struct mp_keymap keymap[] = {
     {XK_F4, MP_KEY_F+4}, {XK_F5, MP_KEY_F+5}, {XK_F6, MP_KEY_F+6},
     {XK_F7, MP_KEY_F+7}, {XK_F8, MP_KEY_F+8}, {XK_F9, MP_KEY_F+9},
     {XK_F10, MP_KEY_F+10}, {XK_F11, MP_KEY_F+11}, {XK_F12, MP_KEY_F+12},
+    {XK_F13, MP_KEY_F+13}, {XK_F14, MP_KEY_F+14}, {XK_F15, MP_KEY_F+15},
+    {XK_F16, MP_KEY_F+16}, {XK_F17, MP_KEY_F+17}, {XK_F18, MP_KEY_F+18},
+    {XK_F19, MP_KEY_F+19}, {XK_F20, MP_KEY_F+20}, {XK_F21, MP_KEY_F+21},
+    {XK_F22, MP_KEY_F+22}, {XK_F23, MP_KEY_F+23}, {XK_F24, MP_KEY_F+24},
 
     // numpad independent of numlock
     {XK_KP_Subtract, '-'}, {XK_KP_Add, '+'}, {XK_KP_Multiply, '*'},
@@ -679,11 +737,11 @@ static const struct mp_keymap keymap[] = {
     {XK_KP_Separator, MP_KEY_KPDEC},
 
     // numpad without numlock
-    {XK_KP_Insert, MP_KEY_KPINS}, {XK_KP_End, MP_KEY_KP1},
-    {XK_KP_Down, MP_KEY_KP2}, {XK_KP_Page_Down, MP_KEY_KP3},
-    {XK_KP_Left, MP_KEY_KP4}, {XK_KP_Begin, MP_KEY_KP5},
-    {XK_KP_Right, MP_KEY_KP6}, {XK_KP_Home, MP_KEY_KP7}, {XK_KP_Up, MP_KEY_KP8},
-    {XK_KP_Page_Up, MP_KEY_KP9}, {XK_KP_Delete, MP_KEY_KPDEL},
+    {XK_KP_Insert, MP_KEY_KPINS}, {XK_KP_End, MP_KEY_KPEND},
+    {XK_KP_Down, MP_KEY_KPDOWN}, {XK_KP_Page_Down, MP_KEY_KPPGDOWN},
+    {XK_KP_Left, MP_KEY_KPLEFT}, {XK_KP_Begin, MP_KEY_KP5},
+    {XK_KP_Right, MP_KEY_KPRIGHT}, {XK_KP_Home, MP_KEY_KPHOME}, {XK_KP_Up, MP_KEY_KPUP},
+    {XK_KP_Page_Up, MP_KEY_KPPGUP}, {XK_KP_Delete, MP_KEY_KPDEL},
 
     {XF86XK_MenuKB, MP_KEY_MENU},
     {XF86XK_AudioPlay, MP_KEY_PLAY}, {XF86XK_AudioPause, MP_KEY_PAUSE},
@@ -696,6 +754,8 @@ static const struct mp_keymap keymap[] = {
     {XF86XK_HomePage, MP_KEY_HOMEPAGE}, {XF86XK_WWW, MP_KEY_WWW},
     {XF86XK_Mail, MP_KEY_MAIL}, {XF86XK_Favorites, MP_KEY_FAVORITES},
     {XF86XK_Search, MP_KEY_SEARCH}, {XF86XK_Sleep, MP_KEY_SLEEP},
+    {XF86XK_Back, MP_KEY_BACK}, {XF86XK_Tools, MP_KEY_TOOLS},
+    {XF86XK_ZoomIn, MP_KEY_ZOOMIN}, {XF86XK_ZoomOut, MP_KEY_ZOOMOUT},
 
     {0, 0}
 };
@@ -748,10 +808,20 @@ static void vo_x11_decoration(struct vo *vo, bool d)
                     PropModeReplace, (unsigned char *) &mhints, 5);
 }
 
+static void vo_x11_wm_hints(struct vo *vo, Window window)
+{
+    struct vo_x11_state *x11 = vo->x11;
+    XWMHints hints = {0};
+    hints.flags = InputHint | StateHint;
+    hints.input = 1;
+    hints.initial_state = NormalState;
+    XSetWMHints(x11->display, window, &hints);
+}
+
 static void vo_x11_classhint(struct vo *vo, Window window, const char *name)
 {
-    struct mp_vo_opts *opts = vo->opts;
     struct vo_x11_state *x11 = vo->x11;
+    struct mp_vo_opts *opts = x11->opts;
     XClassHint wmClass;
     long pid = getpid();
 
@@ -772,29 +842,20 @@ void vo_x11_uninit(struct vo *vo)
 
     set_screensaver(x11, true);
 
-    if (x11->window != None && x11->window != x11->rootwin) {
-        XUnmapWindow(x11->display, x11->window);
+    if (x11->window != None && x11->window != x11->rootwin)
         XDestroyWindow(x11->display, x11->window);
-    }
     if (x11->xic)
         XDestroyIC(x11->xic);
     if (x11->colormap != None)
         XFreeColormap(vo->x11->display, x11->colormap);
 
-    MP_VERBOSE(x11, "uninit ...\n");
+    MP_DBG(x11, "uninit ...\n");
     if (x11->xim)
         XCloseIM(x11->xim);
     if (x11->display) {
         XSetErrorHandler(NULL);
         x11_error_output = NULL;
         XCloseDisplay(x11->display);
-    }
-
-    if (x11->screensaver_thread_running) {
-        atomic_store(&x11->screensaver_terminate, true);
-        sem_post(&x11->screensaver_sem);
-        pthread_join(x11->screensaver_thread, NULL);
-        sem_destroy(&x11->screensaver_sem);
     }
 
     if (x11->wakeup_pipe[0] >= 0) {
@@ -929,15 +990,20 @@ static void vo_x11_dnd_handle_selection(struct vo *vo, XSelectionEvent *se)
 
     if (se->selection == XA(x11, XdndSelection) &&
         se->property == XAs(x11, DND_PROPERTY) &&
-        se->target == x11->dnd_requested_format)
+        se->target == x11->dnd_requested_format &&
+        x11->opts->drag_and_drop != -2)
     {
         int nitems;
         void *prop = x11_get_property(x11, x11->window, XAs(x11, DND_PROPERTY),
                                       x11->dnd_requested_format, 8, &nitems);
         if (prop) {
-            enum mp_dnd_action action =
-                x11->dnd_requested_action == XA(x11, XdndActionCopy) ?
-                DND_REPLACE : DND_APPEND;
+            enum mp_dnd_action action;
+            if (x11->opts->drag_and_drop >= 0) {
+                action = x11->opts->drag_and_drop;
+            } else {
+                action = x11->dnd_requested_action == XA(x11, XdndActionCopy) ?
+                         DND_REPLACE : DND_APPEND;
+            }
 
             char *mime_type = x11_dnd_mime_type(x11, x11->dnd_requested_format);
             MP_VERBOSE(x11, "Dropping type: %s (%s)\n",
@@ -999,7 +1065,7 @@ static void vo_x11_update_composition_hint(struct vo *vo)
     struct vo_x11_state *x11 = vo->x11;
 
     long hint = 0;
-    switch (vo->opts->x11_bypass_compositor) {
+    switch (x11->opts->x11_bypass_compositor) {
     case 0: hint = 0; break; // leave default
     case 1: hint = 1; break; // always bypass
     case 2: hint = x11->fs ? 1 : 0; break; // bypass in FS
@@ -1010,9 +1076,10 @@ static void vo_x11_update_composition_hint(struct vo *vo)
                     XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&hint, 1);
 }
 
-static void vo_x11_check_net_wm_state_fullscreen_change(struct vo *vo)
+static void vo_x11_check_net_wm_state_change(struct vo *vo)
 {
     struct vo_x11_state *x11 = vo->x11;
+    struct mp_vo_opts *opts = x11->opts;
 
     if (x11->parent)
         return;
@@ -1021,24 +1088,40 @@ static void vo_x11_check_net_wm_state_fullscreen_change(struct vo *vo)
         int num_elems;
         long *elems = x11_get_property(x11, x11->window, XA(x11, _NET_WM_STATE),
                                        XA_ATOM, 32, &num_elems);
-        int is_fullscreen = 0;
+        int is_fullscreen = 0, is_minimized = 0, is_maximized = 0;
         if (elems) {
             Atom fullscreen_prop = XA(x11, _NET_WM_STATE_FULLSCREEN);
+            Atom hidden = XA(x11, _NET_WM_STATE_HIDDEN);
+            Atom max_vert = XA(x11, _NET_WM_STATE_MAXIMIZED_VERT);
+            Atom max_horiz = XA(x11, _NET_WM_STATE_MAXIMIZED_HORZ);
             for (int n = 0; n < num_elems; n++) {
-                if (elems[n] == fullscreen_prop) {
+                if (elems[n] == fullscreen_prop)
                     is_fullscreen = 1;
-                    break;
-                }
+                if (elems[n] == hidden)
+                    is_minimized = 1;
+                if (elems[n] == max_vert || elems[n] == max_horiz)
+                    is_maximized = 1;
             }
             XFree(elems);
         }
 
-        if ((vo->opts->fullscreen && !is_fullscreen) ||
-            (!vo->opts->fullscreen && is_fullscreen))
+        if (opts->window_maximized && !is_maximized && x11->geometry_change) {
+            x11->geometry_change = false;
+            vo_x11_config_vo_window(vo);
+        }
+
+        opts->window_minimized = is_minimized;
+        x11->hidden = is_minimized;
+        m_config_cache_write_opt(x11->opts_cache, &opts->window_minimized);
+        opts->window_maximized = is_maximized;
+        m_config_cache_write_opt(x11->opts_cache, &opts->window_maximized);
+
+        if ((x11->opts->fullscreen && !is_fullscreen) ||
+            (!x11->opts->fullscreen && is_fullscreen))
         {
-            vo->opts->fullscreen = is_fullscreen;
+            x11->opts->fullscreen = is_fullscreen;
             x11->fs = is_fullscreen;
-            x11->pending_vo_events |= VO_EVENT_FULLSCREEN_STATE;
+            m_config_cache_write_opt(x11->opts_cache, &x11->opts->fullscreen);
 
             if (!is_fullscreen && (x11->pos_changed_during_fs ||
                                    x11->size_changed_during_fs))
@@ -1053,6 +1136,22 @@ static void vo_x11_check_net_wm_state_fullscreen_change(struct vo *vo)
 
             vo_x11_update_composition_hint(vo);
         }
+    }
+}
+
+static void vo_x11_check_net_wm_desktop_change(struct vo *vo)
+{
+    struct vo_x11_state *x11 = vo->x11;
+
+    if (x11->parent)
+        return;
+
+    long params[1] = {0};
+    if (x11_get_property_copy(x11, x11->window, XA(x11, _NET_WM_DESKTOP),
+                              XA_CARDINAL, 32, params, sizeof(params)))
+    {
+        x11->opts->all_workspaces = params[0] == -1; // (gets sign-extended?)
+        m_config_cache_write_opt(x11->opts_cache, &x11->opts->all_workspaces);
     }
 }
 
@@ -1121,11 +1220,13 @@ void vo_x11_check_events(struct vo *vo)
         case FocusIn:
             x11->has_focus = true;
             vo_update_cursor(vo);
+            x11->pending_vo_events |= VO_EVENT_FOCUS;
             break;
         case FocusOut:
             release_all_keys(vo);
             x11->has_focus = false;
             vo_update_cursor(vo);
+            x11->pending_vo_events |= VO_EVENT_FOCUS;
             break;
         case KeyRelease:
             release_all_keys(vo);
@@ -1185,7 +1286,7 @@ void vo_x11_check_events(struct vo *vo)
         case MapNotify:
             x11->window_hidden = false;
             x11->pseudo_mapped = true;
-            x11->current_icc_screen = -1;
+            x11->current_screen = -1;
             vo_x11_update_geometry(vo);
             break;
         case DestroyNotify:
@@ -1212,12 +1313,29 @@ void vo_x11_check_events(struct vo *vo)
                     x11->pseudo_mapped = true;
                 }
             } else if (Event.xproperty.atom == XA(x11, _NET_WM_STATE)) {
-                x11->pending_vo_events |= VO_EVENT_WIN_STATE;
-                vo_x11_check_net_wm_state_fullscreen_change(vo);
+                vo_x11_check_net_wm_state_change(vo);
+            } else if (Event.xproperty.atom == XA(x11, _NET_WM_DESKTOP)) {
+                vo_x11_check_net_wm_desktop_change(vo);
             } else if (Event.xproperty.atom == x11->icc_profile_property) {
                 x11->pending_vo_events |= VO_EVENT_ICC_PROFILE_CHANGED;
             }
             break;
+        case GenericEvent: {
+            XGenericEventCookie *cookie = (XGenericEventCookie *)&Event.xcookie;
+            if (cookie->extension == x11->present_code && x11->use_present)
+            {
+                XGetEventData(x11->display, cookie);
+                if (cookie->evtype == PresentCompleteNotify) {
+                    XPresentCompleteNotifyEvent *present_event;
+                    present_event = (XPresentCompleteNotifyEvent *)cookie->data;
+                    present_update_sync_values(x11->present,
+                                               present_event->ust * 1000,
+                                               present_event->msc);
+                }
+            }
+            XFreeEventData(x11->display, cookie);
+            break;
+        }
         default:
             if (Event.type == x11->ShmCompletionEvent) {
                 if (x11->ShmCompletionWaitCount > 0)
@@ -1236,15 +1354,20 @@ void vo_x11_check_events(struct vo *vo)
 
 static void vo_x11_sizehint(struct vo *vo, struct mp_rect rc, bool override_pos)
 {
-    struct mp_vo_opts *opts = vo->opts;
     struct vo_x11_state *x11 = vo->x11;
+    struct mp_vo_opts *opts = x11->opts;
 
     if (!x11->window || x11->parent)
         return;
 
+    bool screen = opts->screen_id >= 0 || (opts->screen_name &&
+                                           opts->screen_name[0]);
+    bool fsscreen = opts->fsscreen_id >= 0 || (opts->fsscreen_name &&
+                                               opts->fsscreen_name[0]);
     bool force_pos = opts->geometry.xy_valid ||     // explicitly forced by user
                      opts->force_window_position || // resize -> reset position
-                     opts->screen_id >= 0 ||        // force onto screen area
+                     screen || fsscreen          || // force onto screen area
+                     opts->screen_name ||           // also force onto screen area
                      x11->parent ||                 // force to fill parent
                      override_pos;                  // for fullscreen and such
 
@@ -1272,11 +1395,8 @@ static void vo_x11_sizehint(struct vo *vo, struct mp_rect rc, bool override_pos)
     hint->flags |= PMinSize;
     hint->min_width = hint->min_height = 4;
 
-    // This will use the top/left corner of the window for positioning, instead
-    // of the top/left corner of the client. _NET_MOVERESIZE_WINDOW could be
-    // used to get a different reference point, while keeping gravity.
     hint->flags |= PWinGravity;
-    hint->win_gravity = CenterGravity;
+    hint->win_gravity = StaticGravity;
 
     XSetWMNormalHints(x11->display, x11->window, hint);
     XFree(hint);
@@ -1319,9 +1439,7 @@ static void vo_x11_set_property_string(struct vo *vo, Atom name, const char *t)
         // can do this correctly.
         vo_x11_set_property_utf8(vo, name, t);
     }
-
-    if (prop.value)
-        XFree(prop.value);
+    XFree(prop.value);
 }
 
 static void vo_x11_update_window_title(struct vo *vo)
@@ -1333,8 +1451,13 @@ static void vo_x11_update_window_title(struct vo *vo)
 
     vo_x11_set_property_string(vo, XA_WM_NAME, x11->window_title);
     vo_x11_set_property_string(vo, XA_WM_ICON_NAME, x11->window_title);
-    vo_x11_set_property_utf8(vo, XA(x11, _NET_WM_NAME), x11->window_title);
-    vo_x11_set_property_utf8(vo, XA(x11, _NET_WM_ICON_NAME), x11->window_title);
+
+    /* _NET_WM_NAME and _NET_WM_ICON_NAME must be sanitized to UTF-8. */
+    void *tmp = talloc_new(NULL);
+    struct bstr b_title = bstr_sanitize_utf8_latin1(tmp, bstr0(x11->window_title));
+    vo_x11_set_property_utf8(vo, XA(x11, _NET_WM_NAME), bstrto0(tmp, b_title));
+    vo_x11_set_property_utf8(vo, XA(x11, _NET_WM_ICON_NAME), bstrto0(tmp, b_title));
+    talloc_free(tmp);
 }
 
 static void vo_x11_xembed_update(struct vo_x11_state *x11, int flags)
@@ -1442,6 +1565,14 @@ static void vo_x11_create_window(struct vo *vo, XVisualInfo *vis,
     Atom protos[1] = {XA(x11, WM_DELETE_WINDOW)};
     XSetWMProtocols(x11->display, x11->window, protos, 1);
 
+    if (!XPresentQueryExtension(x11->display, &x11->present_code, NULL, NULL)) {
+        MP_VERBOSE(x11, "The XPresent extension is not supported.\n");
+    } else {
+        MP_VERBOSE(x11, "The XPresent extension was found.\n");
+        XPresentSelectInput(x11->display, x11->window, PresentCompleteNotifyMask);
+    }
+    xpresent_set(x11);
+
     x11->mouse_cursor_set = false;
     x11->mouse_cursor_visible = true;
     vo_update_cursor(vo);
@@ -1457,10 +1588,11 @@ static void vo_x11_create_window(struct vo *vo, XVisualInfo *vis,
     if (!x11->parent) {
         vo_x11_update_composition_hint(vo);
         vo_x11_set_wm_icon(x11);
-        vo_x11_update_window_title(vo);
         vo_x11_dnd_init_window(vo);
         vo_x11_set_property_utf8(vo, XA(x11, _GTK_THEME_VARIANT), "dark");
     }
+    if (!x11->parent || x11->opts->x11_wid_title)
+        vo_x11_update_window_title(vo);
     vo_x11_xembed_update(x11, 0);
 }
 
@@ -1469,9 +1601,9 @@ static void vo_x11_map_window(struct vo *vo, struct mp_rect rc)
     struct vo_x11_state *x11 = vo->x11;
 
     vo_x11_move_resize(vo, true, true, rc);
-    vo_x11_decoration(vo, vo->opts->border);
+    vo_x11_decoration(vo, x11->opts->border);
 
-    if (vo->opts->fullscreen && (x11->wm_type & vo_wm_FULLSCREEN)) {
+    if (x11->opts->fullscreen && (x11->wm_type & vo_wm_FULLSCREEN)) {
         Atom state = XA(x11, _NET_WM_STATE_FULLSCREEN);
         XChangeProperty(x11->display, x11->window, XA(x11, _NET_WM_STATE), XA_ATOM,
                         32, PropModeAppend, (unsigned char *)&state, 1);
@@ -1481,11 +1613,11 @@ static void vo_x11_map_window(struct vo *vo, struct mp_rect rc)
         x11->pos_changed_during_fs = true;
     }
 
-    if (vo->opts->fsscreen_id != -1) {
+    if (x11->opts->fsscreen_id != -1) {
         long params[5] = {0};
-        if (vo->opts->fsscreen_id >= 0) {
+        if (x11->opts->fsscreen_id >= 0) {
             for (int n = 0; n < 4; n++)
-                params[n] = vo->opts->fsscreen_id;
+                params[n] = x11->opts->fsscreen_id;
         } else {
             vo_x11_get_bounding_monitors(x11, &params[0]);
         }
@@ -1493,8 +1625,18 @@ static void vo_x11_map_window(struct vo *vo, struct mp_rect rc)
         x11_send_ewmh_msg(x11, "_NET_WM_FULLSCREEN_MONITORS", params);
     }
 
-    if (vo->opts->all_workspaces) {
-        long v = 0xFFFFFFFF;
+    if (x11->opts->all_workspaces) {
+        if (x11->wm_type & vo_wm_STICKY) {
+            Atom state = XA(x11, _NET_WM_STATE_STICKY);
+            XChangeProperty(x11->display, x11->window, XA(x11, _NET_WM_STATE), XA_ATOM,
+                            32, PropModeReplace, (unsigned char *)&state, 1);
+        } else {
+            long v = 0xFFFFFFFF;
+            XChangeProperty(x11->display, x11->window, XA(x11, _NET_WM_DESKTOP),
+                            XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&v, 1);
+        }
+    } else if (x11->opts->geometry.ws > 0) {
+        long v = x11->opts->geometry.ws - 1;
         XChangeProperty(x11->display, x11->window, XA(x11, _NET_WM_DESKTOP),
                         XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&v, 1);
     }
@@ -1511,7 +1653,15 @@ static void vo_x11_map_window(struct vo *vo, struct mp_rect rc)
     vo_x11_selectinput_witherr(vo, x11->display, x11->window, events);
     XMapWindow(x11->display, x11->window);
 
-    if (vo->opts->fullscreen && (x11->wm_type & vo_wm_FULLSCREEN))
+    if (x11->opts->cursor_passthrough)
+        vo_x11_set_input_region(vo, true);
+
+    if (x11->opts->window_maximized) // don't override WM default on "no"
+        vo_x11_maximize(vo);
+    if (x11->opts->window_minimized) // don't override WM default on "no"
+        vo_x11_minimize(vo);
+
+    if (x11->opts->fullscreen && (x11->wm_type & vo_wm_FULLSCREEN))
         x11_set_ewmh_state(x11, "_NET_WM_STATE_FULLSCREEN", 1);
 
     vo_x11_xembed_update(x11, XEMBED_MAPPED);
@@ -1519,8 +1669,8 @@ static void vo_x11_map_window(struct vo *vo, struct mp_rect rc)
 
 static void vo_x11_highlevel_resize(struct vo *vo, struct mp_rect rc)
 {
-    struct mp_vo_opts *opts = vo->opts;
     struct vo_x11_state *x11 = vo->x11;
+    struct mp_vo_opts *opts = x11->opts;
 
     bool reset_pos = opts->force_window_position;
     if (reset_pos) {
@@ -1577,6 +1727,7 @@ bool vo_x11_create_vo_window(struct vo *vo, XVisualInfo *vis,
     if (x11->window == None) {
         vo_x11_create_window(vo, vis, (struct mp_rect){.x1 = 320, .y1 = 200 });
         vo_x11_classhint(vo, x11->window, classname);
+        vo_x11_wm_hints(vo, x11->window);
         x11->window_hidden = true;
     }
 
@@ -1586,10 +1737,14 @@ bool vo_x11_create_vo_window(struct vo *vo, XVisualInfo *vis,
 // Resize the window (e.g. new file, or video resolution change)
 void vo_x11_config_vo_window(struct vo *vo)
 {
-    struct mp_vo_opts *opts = vo->opts;
     struct vo_x11_state *x11 = vo->x11;
+    struct mp_vo_opts *opts = x11->opts;
 
     assert(x11->window);
+
+    // Don't attempt to change autofit/geometry on maximized windows.
+    if (x11->geometry_change && opts->window_maximized)
+        return;
 
     vo_x11_update_screeninfo(vo);
 
@@ -1604,7 +1759,9 @@ void vo_x11_config_vo_window(struct vo *vo)
         rc = (struct mp_rect){0, 0, RC_W(x11->winrc), RC_H(x11->winrc)};
     }
 
-    bool reset_size = x11->old_dw != RC_W(rc) || x11->old_dh != RC_H(rc);
+    bool reset_size = (x11->old_dw != RC_W(rc) || x11->old_dh != RC_H(rc)) &&
+                      (opts->auto_window_resize || x11->geometry_change);
+
     x11->old_dw = RC_W(rc);
     x11->old_dh = RC_H(rc);
 
@@ -1615,6 +1772,8 @@ void vo_x11_config_vo_window(struct vo *vo)
         vo_x11_highlevel_resize(vo, rc);
     }
 
+    x11->geometry_change = false;
+
     if (opts->ontop)
         vo_x11_setlayer(vo, opts->ontop);
 
@@ -1624,6 +1783,23 @@ void vo_x11_config_vo_window(struct vo *vo)
     vo_x11_update_geometry(vo);
     update_vo_size(vo);
     x11->pending_vo_events &= ~VO_EVENT_RESIZE; // implicitly done by the VO
+}
+
+static void vo_x11_sticky(struct vo *vo, bool sticky)
+{
+    struct vo_x11_state *x11 = vo->x11;
+    if (x11->wm_type & vo_wm_STICKY) {
+        x11_set_ewmh_state(x11, "_NET_WM_STATE_STICKY", sticky);
+    } else {
+        long params[5] = {0xFFFFFFFF, 1};
+        if (!sticky) {
+            x11_get_property_copy(x11, x11->rootwin,
+                XA(x11, _NET_CURRENT_DESKTOP),
+                XA_CARDINAL, 32, &params[0],
+                sizeof(params[0]));
+        }
+        x11_send_ewmh_msg(x11, "_NET_WM_DESKTOP", params);
+    }
 }
 
 static void vo_x11_setlayer(struct vo *vo, bool ontop)
@@ -1665,23 +1841,6 @@ static bool rc_overlaps(struct mp_rect rc1, struct mp_rect rc2)
     return mp_rect_intersection(&rc1, &rc2); // changes the first argument
 }
 
-// which screen's ICC profile we're going to use
-static int get_icc_screen(struct vo *vo)
-{
-    struct vo_x11_state *x11 = vo->x11;
-    int cx = x11->winrc.x0 + (x11->winrc.x1 - x11->winrc.x0)/2,
-    cy = x11->winrc.y0 + (x11->winrc.y1 - x11->winrc.y0)/2;
-    int screen = x11->current_icc_screen; // xinerama screen number
-    for (int n = 0; n < x11->num_displays; n++) {
-        struct xrandr_display *disp = &x11->displays[n];
-        if (mp_rect_contains(&disp->rc, cx, cy)) {
-            screen = n;
-            break;
-        }
-    }
-    return screen;
-}
-
 // update x11->winrc with current boundaries of vo->x11->window
 static void vo_x11_update_geometry(struct vo *vo)
 {
@@ -1701,31 +1860,31 @@ static void vo_x11_update_geometry(struct vo *vo)
                               &x, &y, &dummy_win);
         x11->winrc = (struct mp_rect){x, y, x + w, y + h};
     }
-    double fps = 1000.0;
-    for (int n = 0; n < x11->num_displays; n++) {
-        struct xrandr_display *disp = &x11->displays[n];
-        disp->overlaps = rc_overlaps(disp->rc, x11->winrc);
-        if (disp->overlaps)
-            fps = MPMIN(fps, disp->fps);
+    struct xrandr_display *disp = get_current_display(vo);
+    // Try to fallback to something reasonable if we have no disp yet
+    if (!disp) {
+        int screen = vo_x11_select_screen(vo);
+        if (screen > -1) {
+            disp = &x11->displays[screen];
+        } else if (x11->current_screen > - 1) {
+            disp = &x11->displays[x11->current_screen];
+        }
     }
-    double fallback = x11->num_displays > 0 ? x11->displays[0].fps : 0;
-    fps = fps < 1000.0 ? fps : fallback;
+    double fps = disp ? disp->fps : 0;
     if (fps != x11->current_display_fps)
         MP_VERBOSE(x11, "Current display FPS: %f\n", fps);
     x11->current_display_fps = fps;
-    // might have changed displays
-    x11->pending_vo_events |= VO_EVENT_WIN_STATE;
-    int icc_screen = get_icc_screen(vo);
-    if (x11->current_icc_screen != icc_screen) {
-        x11->current_icc_screen = icc_screen;
+    if (disp && x11->current_screen != disp->screen) {
+        x11->current_screen = disp->screen;
         x11->pending_vo_events |= VO_EVENT_ICC_PROFILE_CHANGED;
     }
+    x11->pending_vo_events |= VO_EVENT_WIN_STATE;
 }
 
 static void vo_x11_fullscreen(struct vo *vo)
 {
-    struct mp_vo_opts *opts = vo->opts;
     struct vo_x11_state *x11 = vo->x11;
+    struct mp_vo_opts *opts = x11->opts;
 
     if (opts->fullscreen == x11->fs)
         return;
@@ -1781,74 +1940,138 @@ static void vo_x11_fullscreen(struct vo *vo)
     vo_x11_update_composition_hint(vo);
 }
 
+static void vo_x11_maximize(struct vo *vo)
+{
+    struct vo_x11_state *x11 = vo->x11;
+
+    long params[5] = {
+        x11->opts->window_maximized ? NET_WM_STATE_ADD : NET_WM_STATE_REMOVE,
+        XA(x11, _NET_WM_STATE_MAXIMIZED_VERT),
+        XA(x11, _NET_WM_STATE_MAXIMIZED_HORZ),
+        1, // source indication: normal
+    };
+    x11_send_ewmh_msg(x11, "_NET_WM_STATE", params);
+}
+
+static void vo_x11_minimize(struct vo *vo)
+{
+    struct vo_x11_state *x11 = vo->x11;
+
+    if (x11->opts->window_minimized) {
+        XIconifyWindow(x11->display, x11->window, x11->screen);
+    } else {
+        long params[5] = {0};
+        x11_send_ewmh_msg(x11, "_NET_ACTIVE_WINDOW", params);
+    }
+}
+
+static void vo_x11_set_geometry(struct vo *vo)
+{
+    struct vo_x11_state *x11 = vo->x11;
+
+    if (!x11->window)
+        return;
+
+    x11->geometry_change = true;
+    vo_x11_config_vo_window(vo);
+}
+
+bool vo_x11_check_visible(struct vo *vo)
+{
+    struct vo_x11_state *x11 = vo->x11;
+    struct mp_vo_opts *opts = x11->opts;
+
+    bool render = !x11->hidden || opts->force_render ||
+                  VS_IS_DISP(opts->video_sync);
+    return render;
+}
+
+static void vo_x11_set_input_region(struct vo *vo, bool passthrough)
+{
+    struct vo_x11_state *x11 = vo->x11;
+
+    if (passthrough) {
+        XRectangle rect = {0, 0, 0, 0};
+        Region region = XCreateRegion();
+        XUnionRectWithRegion(&rect, region, region);
+        XShapeCombineRegion(x11->display, x11->window, ShapeInput, 0, 0,
+                            region, ShapeSet);
+        XDestroyRegion(region);
+    } else {
+        XShapeCombineMask(x11->display, x11->window, ShapeInput, 0, 0,
+                          0, ShapeSet);
+    }
+}
+
 int vo_x11_control(struct vo *vo, int *events, int request, void *arg)
 {
-    struct mp_vo_opts *opts = vo->opts;
     struct vo_x11_state *x11 = vo->x11;
+    struct mp_vo_opts *opts = x11->opts;
     switch (request) {
     case VOCTRL_CHECK_EVENTS:
         vo_x11_check_events(vo);
         *events |= x11->pending_vo_events;
         x11->pending_vo_events = 0;
         return VO_TRUE;
-    case VOCTRL_FULLSCREEN:
-        vo_x11_fullscreen(vo);
-        return VO_TRUE;
-    case VOCTRL_GET_FULLSCREEN:
-        *(int *)arg = x11->fs;
-        return VO_TRUE;
-    case VOCTRL_ONTOP:
-        vo_x11_setlayer(vo, opts->ontop);
-        return VO_TRUE;
-    case VOCTRL_BORDER:
-        vo_x11_decoration(vo, vo->opts->border);
-        return VO_TRUE;
-    case VOCTRL_ALL_WORKSPACES: {
-        long params[5] = {0xFFFFFFFF, 1};
-        if (!opts->all_workspaces) {
-            x11_get_property_copy(x11, x11->rootwin, XA(x11, _NET_CURRENT_DESKTOP),
-                                  XA_CARDINAL, 32, &params[0], sizeof(params[0]));
+    case VOCTRL_VO_OPTS_CHANGED: {
+        void *opt;
+        while (m_config_cache_get_next_changed(x11->opts_cache, &opt)) {
+            if (opt == &opts->fullscreen)
+                vo_x11_fullscreen(vo);
+            if (opt == &opts->ontop)
+                vo_x11_setlayer(vo, opts->ontop);
+            if (opt == &opts->border)
+                vo_x11_decoration(vo, opts->border);
+            if (opt == &opts->all_workspaces)
+                vo_x11_sticky(vo, opts->all_workspaces);
+            if (opt == &opts->window_minimized)
+                vo_x11_minimize(vo);
+            if (opt == &opts->window_maximized)
+                vo_x11_maximize(vo);
+            if (opt == &opts->cursor_passthrough)
+                vo_x11_set_input_region(vo, opts->cursor_passthrough);
+            if (opt == &opts->x11_present)
+                xpresent_set(x11);
+            if (opt == &opts->geometry || opt == &opts->autofit ||
+                opt == &opts->autofit_smaller || opt == &opts->autofit_larger)
+            {
+                vo_x11_set_geometry(vo);
+            }
         }
-        x11_send_ewmh_msg(x11, "_NET_WM_DESKTOP", params);
         return VO_TRUE;
     }
     case VOCTRL_GET_UNFS_WINDOW_SIZE: {
         int *s = arg;
         if (!x11->window || x11->parent)
             return VO_FALSE;
-        s[0] = x11->fs ? RC_W(x11->nofsrc) : RC_W(x11->winrc);
-        s[1] = x11->fs ? RC_H(x11->nofsrc) : RC_H(x11->winrc);
+        s[0] = (x11->fs ? RC_W(x11->nofsrc) : RC_W(x11->winrc)) / x11->dpi_scale;
+        s[1] = (x11->fs ? RC_H(x11->nofsrc) : RC_H(x11->winrc)) / x11->dpi_scale;
         return VO_TRUE;
     }
     case VOCTRL_SET_UNFS_WINDOW_SIZE: {
         int *s = arg;
         if (!x11->window || x11->parent)
             return VO_FALSE;
+        int w = s[0] * x11->dpi_scale;
+        int h = s[1] * x11->dpi_scale;
         struct mp_rect rc = x11->winrc;
-        rc.x1 = rc.x0 + s[0];
-        rc.y1 = rc.y0 + s[1];
+        rc.x1 = rc.x0 + w;
+        rc.y1 = rc.y0 + h;
+        if (x11->opts->window_maximized) {
+            x11->opts->window_maximized = false;
+            m_config_cache_write_opt(x11->opts_cache,
+                    &x11->opts->window_maximized);
+            vo_x11_maximize(vo);
+        }
         vo_x11_highlevel_resize(vo, rc);
         if (!x11->fs) { // guess new window size, instead of waiting for X
-            x11->winrc.x1 = x11->winrc.x0 + s[0];
-            x11->winrc.y1 = x11->winrc.y0 + s[1];
+            x11->winrc.x1 = x11->winrc.x0 + w;
+            x11->winrc.y1 = x11->winrc.y0 + h;
         }
         return VO_TRUE;
     }
-    case VOCTRL_GET_WIN_STATE: {
-        if (!x11->pseudo_mapped)
-            return VO_FALSE;
-        *(int *)arg = 0;
-        int num_elems;
-        long *elems = x11_get_property(x11, x11->window, XA(x11, _NET_WM_STATE),
-                                       XA_ATOM, 32, &num_elems);
-        if (elems) {
-            Atom hidden = XA(x11, _NET_WM_STATE_HIDDEN);
-            for (int n = 0; n < num_elems; n++) {
-                if (elems[n] == hidden)
-                    *(int *)arg |= VO_WIN_STATE_MINIMIZED;
-            }
-            XFree(elems);
-        }
+    case VOCTRL_GET_FOCUSED: {
+        *(bool *)arg = x11->has_focus;
         return VO_TRUE;
     }
     case VOCTRL_GET_DISPLAY_NAMES: {
@@ -1868,15 +2091,14 @@ int vo_x11_control(struct vo *vo, int *events, int request, void *arg)
     case VOCTRL_GET_ICC_PROFILE: {
         if (!x11->pseudo_mapped)
             return VO_NOTAVAIL;
-        int screen = get_icc_screen(vo);
-        int atom_id = x11->displays[screen].atom_id;
+        int atom_id = x11->displays[x11->current_screen].atom_id;
         char prop[80];
         snprintf(prop, sizeof(prop), "_ICC_PROFILE");
         if (atom_id > 0)
             mp_snprintf_cat(prop, sizeof(prop), "_%d", atom_id);
         x11->icc_profile_property = XAs(x11, prop);
         int len;
-        MP_VERBOSE(x11, "Retrieving ICC profile for display: %d\n", screen);
+        MP_VERBOSE(x11, "Retrieving ICC profile for display: %d\n", x11->current_screen);
         void *icc = x11_get_property(x11, x11->rootwin, x11->icc_profile_property,
                                      XA_CARDINAL, 8, &len);
         if (!icc)
@@ -1900,7 +2122,7 @@ int vo_x11_control(struct vo *vo, int *events, int request, void *arg)
     case VOCTRL_UPDATE_WINDOW_TITLE:
         talloc_free(x11->window_title);
         x11->window_title = talloc_strdup(x11, (char *)arg);
-        if (!x11->parent)
+        if (!x11->parent || x11->opts->x11_wid_title)
             vo_x11_update_window_title(vo);
         return VO_TRUE;
     case VOCTRL_GET_DISPLAY_FPS: {
@@ -1910,8 +2132,34 @@ int vo_x11_control(struct vo *vo, int *events, int request, void *arg)
         *(double *)arg = fps;
         return VO_TRUE;
     }
+    case VOCTRL_GET_DISPLAY_RES: {
+        struct xrandr_display *disp = NULL;
+        if (x11->current_screen > -1)
+            disp = &x11->displays[x11->current_screen];
+        if (!x11->window || x11->parent || !disp)
+            return VO_NOTAVAIL;
+        ((int *)arg)[0] = mp_rect_w(disp->rc);
+        ((int *)arg)[1] = mp_rect_h(disp->rc);
+        return VO_TRUE;
+    }
+    case VOCTRL_GET_WINDOW_ID: {
+        if (!x11->window)
+            return VO_NOTAVAIL;
+        *(int64_t *)arg = x11->window;
+        return VO_TRUE;
+    }
+    case VOCTRL_GET_HIDPI_SCALE:
+        *(double *)arg = x11->dpi_scale;
+        return VO_TRUE;
     }
     return VO_NOTIMPL;
+}
+
+void vo_x11_present(struct vo *vo)
+{
+    struct vo_x11_state *x11 = vo->x11;
+    XPresentNotifyMSC(x11->display, x11->window,
+                      0, 0, 1, 0);
 }
 
 void vo_x11_wakeup(struct vo *vo)
@@ -1921,7 +2169,7 @@ void vo_x11_wakeup(struct vo *vo)
     (void)write(x11->wakeup_pipe[1], &(char){0}, 1);
 }
 
-void vo_x11_wait_events(struct vo *vo, int64_t until_time_us)
+void vo_x11_wait_events(struct vo *vo, int64_t until_time_ns)
 {
     struct vo_x11_state *x11 = vo->x11;
 
@@ -1929,10 +2177,10 @@ void vo_x11_wait_events(struct vo *vo, int64_t until_time_us)
         { .fd = x11->event_fd, .events = POLLIN },
         { .fd = x11->wakeup_pipe[0], .events = POLLIN },
     };
-    int64_t wait_us = until_time_us - mp_time_us();
-    int timeout_ms = MPCLAMP((wait_us + 999) / 1000, 0, 10000);
+    int64_t wait_ns = until_time_ns - mp_time_ns();
+    int64_t timeout_ns = MPCLAMP(wait_ns, 1e6, 1e10);
 
-    poll(fds, 2, timeout_ms);
+    mp_poll(fds, 2, timeout_ns);
 
     if (fds[1].revents & POLLIN)
         mp_flush_wakeup_pipe(x11->wakeup_pipe[0]);
@@ -1946,7 +2194,6 @@ static void xscreensaver_heartbeat(struct vo_x11_state *x11)
         (time - x11->screensaver_time_last) >= 10)
     {
         x11->screensaver_time_last = time;
-        sem_post(&x11->screensaver_sem);
         XResetScreenSaver(x11->display);
     }
 }
@@ -2026,7 +2273,7 @@ bool vo_x11_screen_is_composited(struct vo *vo)
 {
     struct vo_x11_state *x11 = vo->x11;
     char buf[50];
-    sprintf(buf, "_NET_WM_CM_S%d", x11->screen);
+    snprintf(buf, sizeof(buf), "_NET_WM_CM_S%d", x11->screen);
     Atom NET_WM_CM = XInternAtom(x11->display, buf, False);
     return XGetSelectionOwner(x11->display, NET_WM_CM) != None;
 }

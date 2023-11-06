@@ -29,6 +29,7 @@
 
 #include "misc/bstr.h"
 #include "options/m_config.h"
+#include "options/path.h"
 #include "common/global.h"
 #include "options/options.h"
 #include "utils.h"
@@ -107,6 +108,7 @@ struct image {
     struct ra_tex *tex;
     int w, h; // logical size (after transformation)
     struct gl_transform transform; // rendering transformation
+    int padding; // number of leading padding components (e.g. 2 = rg is padding)
 };
 
 // A named image, for user scripting purposes
@@ -215,7 +217,6 @@ struct gl_video {
     struct ra_tex *error_diffusion_tex[2];
     struct ra_tex *screen_tex;
     struct ra_tex *output_tex;
-    struct ra_tex *vdpau_deinterleave_tex[2];
     struct ra_tex **hook_textures;
     int num_hook_textures;
     int idx_hook_textures;
@@ -280,21 +281,20 @@ struct gl_video {
     struct cached_file *files;
     int num_files;
 
-    bool hwdec_interop_loading_done;
-    struct ra_hwdec **hwdecs;
-    int num_hwdecs;
-
+    struct ra_hwdec_ctx hwdec_ctx;
     struct ra_hwdec_mapper *hwdec_mapper;
     struct ra_hwdec *hwdec_overlay;
     bool hwdec_active;
 
     bool dsi_warned;
     bool broken_frame; // temporary error state
+
+    bool colorspace_override_warned;
+    bool correct_downscaling_warned;
 };
 
 static const struct gl_video_opts gl_video_opts_def = {
     .dither_algo = DITHER_FRUIT,
-    .dither_depth = -1,
     .dither_size = 6,
     .temporal_dither_period = 1,
     .error_diffusion = "sierra-lite",
@@ -302,156 +302,182 @@ static const struct gl_video_opts gl_video_opts_def = {
     .sigmoid_center = 0.75,
     .sigmoid_slope = 6.5,
     .scaler = {
-        {{"bilinear", .params={NAN, NAN}}, {.params = {NAN, NAN}},
-         .cutoff = 0.001}, // scale
-        {{NULL,       .params={NAN, NAN}}, {.params = {NAN, NAN}},
-         .cutoff = 0.001}, // dscale
-        {{"bilinear", .params={NAN, NAN}}, {.params = {NAN, NAN}},
-         .cutoff = 0.001}, // cscale
-        {{"mitchell", .params={NAN, NAN}}, {.params = {NAN, NAN}},
-         .clamp = 1, }, // tscale
+        {{"lanczos", .params={NAN, NAN}}, {.params = {NAN, NAN}}},    // scale
+        {{"hermite", .params={NAN, NAN}}, {.params = {NAN, NAN}}},    // dscale
+        {{NULL, .params={NAN, NAN}}, {.params = {NAN, NAN}}},         // cscale
+        {{"oversample", .params={NAN, NAN}}, {.params = {NAN, NAN}}}, // tscale
     },
-    .scaler_resizes_only = 1,
-    .scaler_lut_size = 6,
-    .interpolation_threshold = 0.0001,
+    .scaler_resizes_only = true,
+    .correct_downscaling = true,
+    .linear_downscaling = true,
+    .sigmoid_upscaling = true,
+    .interpolation_threshold = 0.01,
     .alpha_mode = ALPHA_BLEND_TILES,
     .background = {0, 0, 0, 255},
     .gamma = 1.0f,
     .tone_map = {
-        .curve = TONE_MAPPING_HABLE,
+        .curve = TONE_MAPPING_AUTO,
         .curve_param = NAN,
         .max_boost = 1.0,
-        .decay_rate = 100.0,
-        .scene_threshold_low = 5.5,
-        .scene_threshold_high = 10.0,
-        .desat = 0.75,
-        .desat_exp = 1.5,
+        .decay_rate = 20.0,
+        .scene_threshold_low = 1.0,
+        .scene_threshold_high = 3.0,
+        .contrast_smoothness = 3.5,
     },
     .early_flush = -1,
+    .shader_cache = true,
     .hwdec_interop = "auto",
 };
 
 static int validate_scaler_opt(struct mp_log *log, const m_option_t *opt,
-                               struct bstr name, struct bstr param);
+                               struct bstr name, const char **value);
 
 static int validate_window_opt(struct mp_log *log, const m_option_t *opt,
-                               struct bstr name, struct bstr param);
+                               struct bstr name, const char **value);
 
 static int validate_error_diffusion_opt(struct mp_log *log, const m_option_t *opt,
-                                        struct bstr name, struct bstr param);
+                                        struct bstr name, const char **value);
 
 #define OPT_BASE_STRUCT struct gl_video_opts
 
+// Use for options which use NAN for defaults.
+#define OPT_FLOATDEF(field) \
+    OPT_FLOAT(field), \
+    .flags = M_OPT_DEFAULT_NAN
+
 #define SCALER_OPTS(n, i) \
-    OPT_STRING_VALIDATE(n, scaler[i].kernel.name, 0, validate_scaler_opt), \
-    OPT_FLOAT(n"-param1", scaler[i].kernel.params[0], 0),                  \
-    OPT_FLOAT(n"-param2", scaler[i].kernel.params[1], 0),                  \
-    OPT_FLOAT(n"-blur",   scaler[i].kernel.blur, 0),                       \
-    OPT_FLOATRANGE(n"-cutoff", scaler[i].cutoff, 0, 0.0, 1.0),             \
-    OPT_FLOATRANGE(n"-taper", scaler[i].kernel.taper, 0, 0.0, 1.0),        \
-    OPT_FLOAT(n"-wparam", scaler[i].window.params[0], 0),                  \
-    OPT_FLOAT(n"-wblur",  scaler[i].window.blur, 0),                       \
-    OPT_FLOATRANGE(n"-wtaper", scaler[i].window.taper, 0, 0.0, 1.0),       \
-    OPT_FLOATRANGE(n"-clamp", scaler[i].clamp, 0, 0.0, 1.0),               \
-    OPT_FLOATRANGE(n"-radius",    scaler[i].radius, 0, 0.5, 16.0),         \
-    OPT_FLOATRANGE(n"-antiring",  scaler[i].antiring, 0, 0.0, 1.0),        \
-    OPT_STRING_VALIDATE(n"-window", scaler[i].window.name, 0, validate_window_opt)
+    {n, OPT_STRING_VALIDATE(scaler[i].kernel.name, validate_scaler_opt)},  \
+    {n"-param1", OPT_FLOATDEF(scaler[i].kernel.params[0])},                \
+    {n"-param2", OPT_FLOATDEF(scaler[i].kernel.params[1])},                \
+    {n"-blur",   OPT_FLOAT(scaler[i].kernel.blur)},                        \
+    {n"-cutoff", OPT_REMOVED("Hard-coded as 0.001")},                      \
+    {n"-taper",  OPT_FLOAT(scaler[i].kernel.taper), M_RANGE(0.0, 1.0)},    \
+    {n"-wparam", OPT_FLOATDEF(scaler[i].window.params[0])},                \
+    {n"-wblur",  OPT_REMOVED("Just adjust filter radius directly")},       \
+    {n"-wtaper", OPT_FLOAT(scaler[i].window.taper), M_RANGE(0.0, 1.0)},    \
+    {n"-clamp",  OPT_FLOAT(scaler[i].clamp), M_RANGE(0.0, 1.0)},           \
+    {n"-radius", OPT_FLOAT(scaler[i].radius), M_RANGE(0.5, 16.0)},         \
+    {n"-antiring", OPT_FLOAT(scaler[i].antiring), M_RANGE(0.0, 1.0)},      \
+    {n"-window", OPT_STRING_VALIDATE(scaler[i].window.name, validate_window_opt)}
 
 const struct m_sub_options gl_video_conf = {
     .opts = (const m_option_t[]) {
-        OPT_CHOICE("gpu-dumb-mode", dumb_mode, 0,
-                   ({"auto", 0}, {"yes", 1}, {"no", -1})),
-        OPT_FLOATRANGE("gamma-factor", gamma, 0, 0.1, 2.0),
-        OPT_FLAG("gamma-auto", gamma_auto, 0),
-        OPT_CHOICE_C("target-prim", target_prim, 0, mp_csp_prim_names),
-        OPT_CHOICE_C("target-trc", target_trc, 0, mp_csp_trc_names),
-        OPT_CHOICE_OR_INT("target-peak", target_peak, 0, 10, 10000,
-                          ({"auto", 0})),
-        OPT_CHOICE("tone-mapping", tone_map.curve, 0,
-                   ({"clip",     TONE_MAPPING_CLIP},
-                    {"mobius",   TONE_MAPPING_MOBIUS},
-                    {"reinhard", TONE_MAPPING_REINHARD},
-                    {"hable",    TONE_MAPPING_HABLE},
-                    {"gamma",    TONE_MAPPING_GAMMA},
-                    {"linear",   TONE_MAPPING_LINEAR})),
-        OPT_CHOICE("hdr-compute-peak", tone_map.compute_peak, 0,
-                   ({"auto", 0},
-                    {"yes", 1},
-                    {"no", -1})),
-        OPT_FLOATRANGE("hdr-peak-decay-rate", tone_map.decay_rate, 0, 1.0, 1000.0),
-        OPT_FLOATRANGE("hdr-scene-threshold-low",
-                       tone_map.scene_threshold_low, 0, 0, 20.0),
-        OPT_FLOATRANGE("hdr-scene-threshold-high",
-                       tone_map.scene_threshold_high, 0, 0, 20.0),
-        OPT_FLOAT("tone-mapping-param", tone_map.curve_param, 0),
-        OPT_FLOATRANGE("tone-mapping-max-boost", tone_map.max_boost, 0, 1.0, 10.0),
-        OPT_FLOAT("tone-mapping-desaturate", tone_map.desat, 0),
-        OPT_FLOATRANGE("tone-mapping-desaturate-exponent",
-                       tone_map.desat_exp, 0, 0.0, 20.0),
-        OPT_FLAG("gamut-warning", tone_map.gamut_warning, 0),
-        OPT_FLAG("opengl-pbo", pbo, 0),
+        {"gpu-dumb-mode", OPT_CHOICE(dumb_mode,
+            {"auto", 0}, {"yes", 1}, {"no", -1})},
+        {"gamma-factor", OPT_FLOAT(gamma), M_RANGE(0.1, 2.0),
+            .deprecation_message = "no replacement"},
+        {"gamma-auto", OPT_BOOL(gamma_auto),
+            .deprecation_message = "no replacement"},
+        {"target-prim", OPT_CHOICE_C(target_prim, mp_csp_prim_names)},
+        {"target-trc", OPT_CHOICE_C(target_trc, mp_csp_trc_names)},
+        {"target-peak", OPT_CHOICE(target_peak, {"auto", 0}),
+            M_RANGE(10, 10000)},
+        {"target-contrast", OPT_CHOICE(target_contrast, {"auto", 0}, {"inf", -1}),
+            M_RANGE(10, 1000000)},
+        {"tone-mapping", OPT_CHOICE(tone_map.curve,
+            {"auto",     TONE_MAPPING_AUTO},
+            {"clip",     TONE_MAPPING_CLIP},
+            {"mobius",   TONE_MAPPING_MOBIUS},
+            {"reinhard", TONE_MAPPING_REINHARD},
+            {"hable",    TONE_MAPPING_HABLE},
+            {"gamma",    TONE_MAPPING_GAMMA},
+            {"linear",   TONE_MAPPING_LINEAR},
+            {"spline",   TONE_MAPPING_SPLINE},
+            {"bt.2390",  TONE_MAPPING_BT_2390},
+            {"bt.2446a", TONE_MAPPING_BT_2446A},
+            {"st2094-40", TONE_MAPPING_ST2094_40},
+            {"st2094-10", TONE_MAPPING_ST2094_10})},
+        {"tone-mapping-param", OPT_FLOATDEF(tone_map.curve_param)},
+        {"inverse-tone-mapping", OPT_BOOL(tone_map.inverse)},
+        {"tone-mapping-max-boost", OPT_FLOAT(tone_map.max_boost),
+            M_RANGE(1.0, 10.0)},
+        {"tone-mapping-visualize", OPT_BOOL(tone_map.visualize)},
+        {"gamut-mapping-mode", OPT_CHOICE(tone_map.gamut_mode,
+            {"auto",        GAMUT_AUTO},
+            {"clip",        GAMUT_CLIP},
+            {"perceptual",  GAMUT_PERCEPTUAL},
+            {"relative",    GAMUT_RELATIVE},
+            {"saturation",  GAMUT_SATURATION},
+            {"absolute",    GAMUT_ABSOLUTE},
+            {"desaturate",  GAMUT_DESATURATE},
+            {"darken",      GAMUT_DARKEN},
+            {"warn",        GAMUT_WARN},
+            {"linear",      GAMUT_LINEAR})},
+        {"hdr-compute-peak", OPT_CHOICE(tone_map.compute_peak,
+            {"auto", 0},
+            {"yes", 1},
+            {"no", -1})},
+        {"hdr-peak-percentile", OPT_FLOAT(tone_map.peak_percentile),
+            M_RANGE(0.0, 100.0)},
+        {"hdr-peak-decay-rate", OPT_FLOAT(tone_map.decay_rate),
+            M_RANGE(0.0, 1000.0)},
+        {"hdr-scene-threshold-low", OPT_FLOAT(tone_map.scene_threshold_low),
+            M_RANGE(0, 20.0)},
+        {"hdr-scene-threshold-high", OPT_FLOAT(tone_map.scene_threshold_high),
+            M_RANGE(0, 20.0)},
+        {"hdr-contrast-recovery", OPT_FLOAT(tone_map.contrast_recovery),
+            M_RANGE(0, 2.0)},
+        {"hdr-contrast-smoothness", OPT_FLOAT(tone_map.contrast_smoothness),
+            M_RANGE(1.0, 100.0)},
+        {"opengl-pbo", OPT_BOOL(pbo)},
         SCALER_OPTS("scale",  SCALER_SCALE),
         SCALER_OPTS("dscale", SCALER_DSCALE),
         SCALER_OPTS("cscale", SCALER_CSCALE),
         SCALER_OPTS("tscale", SCALER_TSCALE),
-        OPT_INTRANGE("scaler-lut-size", scaler_lut_size, 0, 4, 10),
-        OPT_FLAG("scaler-resizes-only", scaler_resizes_only, 0),
-        OPT_FLAG("correct-downscaling", correct_downscaling, 0),
-        OPT_FLAG("linear-downscaling", linear_downscaling, 0),
-        OPT_FLAG("linear-upscaling", linear_upscaling, 0),
-        OPT_FLAG("sigmoid-upscaling", sigmoid_upscaling, 0),
-        OPT_FLOATRANGE("sigmoid-center", sigmoid_center, 0, 0.0, 1.0),
-        OPT_FLOATRANGE("sigmoid-slope", sigmoid_slope, 0, 1.0, 20.0),
-        OPT_STRING("fbo-format", fbo_format, 0),
-        OPT_CHOICE_OR_INT("dither-depth", dither_depth, 0, -1, 16,
-                          ({"no", -1}, {"auto", 0})),
-        OPT_CHOICE("dither", dither_algo, 0,
-                   ({"fruit", DITHER_FRUIT},
-                    {"ordered", DITHER_ORDERED},
-                    {"error-diffusion", DITHER_ERROR_DIFFUSION},
-                    {"no", DITHER_NONE})),
-        OPT_INTRANGE("dither-size-fruit", dither_size, 0, 2, 8),
-        OPT_FLAG("temporal-dither", temporal_dither, 0),
-        OPT_INTRANGE("temporal-dither-period", temporal_dither_period, 0, 1, 128),
-        OPT_STRING_VALIDATE("error-diffusion", error_diffusion, 0,
-                            validate_error_diffusion_opt),
-        OPT_CHOICE("alpha", alpha_mode, 0,
-                   ({"no", ALPHA_NO},
-                    {"yes", ALPHA_YES},
-                    {"blend", ALPHA_BLEND},
-                    {"blend-tiles", ALPHA_BLEND_TILES})),
-        OPT_FLAG("opengl-rectangle-textures", use_rectangle, 0),
-        OPT_COLOR("background", background, 0),
-        OPT_FLAG("interpolation", interpolation, 0),
-        OPT_FLOAT("interpolation-threshold", interpolation_threshold, 0),
-        OPT_CHOICE("blend-subtitles", blend_subs, 0,
-                   ({"no", BLEND_SUBS_NO},
-                    {"yes", BLEND_SUBS_YES},
-                    {"video", BLEND_SUBS_VIDEO})),
-        OPT_PATHLIST("glsl-shaders", user_shaders, M_OPT_FILE),
-        OPT_CLI_ALIAS("glsl-shader", "glsl-shaders-append"),
-        OPT_FLAG("deband", deband, 0),
-        OPT_SUBSTRUCT("deband", deband_opts, deband_conf, 0),
-        OPT_FLOAT("sharpen", unsharp, 0),
-        OPT_INTRANGE("gpu-tex-pad-x", tex_pad_x, 0, 0, 4096),
-        OPT_INTRANGE("gpu-tex-pad-y", tex_pad_y, 0, 0, 4096),
-        OPT_SUBSTRUCT("", icc_opts, mp_icc_conf, 0),
-        OPT_STRING("gpu-shader-cache-dir", shader_cache_dir, M_OPT_FILE),
-        OPT_STRING_VALIDATE("gpu-hwdec-interop", hwdec_interop, 0,
-                             ra_hwdec_validate_opt),
-        OPT_REPLACED("opengl-hwdec-interop", "gpu-hwdec-interop"),
-        OPT_REPLACED("hwdec-preload", "opengl-hwdec-interop"),
-        OPT_REPLACED("hdr-tone-mapping", "tone-mapping"),
-        OPT_REPLACED("opengl-shaders", "glsl-shaders"),
-        OPT_REPLACED("opengl-shader", "glsl-shader"),
-        OPT_REPLACED("opengl-shader-cache-dir", "gpu-shader-cache-dir"),
-        OPT_REPLACED("opengl-tex-pad-x", "gpu-tex-pad-x"),
-        OPT_REPLACED("opengl-tex-pad-y", "gpu-tex-pad-y"),
-        OPT_REPLACED("opengl-fbo-format", "fbo-format"),
-        OPT_REPLACED("opengl-dumb-mode", "gpu-dumb-mode"),
-        OPT_REPLACED("opengl-gamma", "gamma-factor"),
-        OPT_REMOVED("linear-scaling", "Split into --linear-upscaling and "
-                    "--linear-downscaling"),
+        {"scaler-lut-size", OPT_REMOVED("hard-coded as 8")},
+        {"scaler-resizes-only", OPT_BOOL(scaler_resizes_only)},
+        {"correct-downscaling", OPT_BOOL(correct_downscaling)},
+        {"linear-downscaling", OPT_BOOL(linear_downscaling)},
+        {"linear-upscaling", OPT_BOOL(linear_upscaling)},
+        {"sigmoid-upscaling", OPT_BOOL(sigmoid_upscaling)},
+        {"sigmoid-center", OPT_FLOAT(sigmoid_center), M_RANGE(0.0, 1.0)},
+        {"sigmoid-slope", OPT_FLOAT(sigmoid_slope), M_RANGE(1.0, 20.0)},
+        {"fbo-format", OPT_STRING(fbo_format)},
+        {"dither-depth", OPT_CHOICE(dither_depth, {"no", -1}, {"auto", 0}),
+            M_RANGE(-1, 16)},
+        {"dither", OPT_CHOICE(dither_algo,
+            {"fruit", DITHER_FRUIT},
+            {"ordered", DITHER_ORDERED},
+            {"error-diffusion", DITHER_ERROR_DIFFUSION},
+            {"no", DITHER_NONE})},
+        {"dither-size-fruit", OPT_INT(dither_size), M_RANGE(2, 8)},
+        {"temporal-dither", OPT_BOOL(temporal_dither)},
+        {"temporal-dither-period", OPT_INT(temporal_dither_period),
+            M_RANGE(1, 128)},
+        {"error-diffusion",
+            OPT_STRING_VALIDATE(error_diffusion, validate_error_diffusion_opt)},
+        {"alpha", OPT_CHOICE(alpha_mode,
+            {"no", ALPHA_NO},
+            {"yes", ALPHA_YES},
+            {"blend", ALPHA_BLEND},
+            {"blend-tiles", ALPHA_BLEND_TILES})},
+        {"opengl-rectangle-textures", OPT_BOOL(use_rectangle)},
+        {"background", OPT_COLOR(background)},
+        {"interpolation", OPT_BOOL(interpolation)},
+        {"interpolation-threshold", OPT_FLOAT(interpolation_threshold)},
+        {"blend-subtitles", OPT_CHOICE(blend_subs,
+            {"no", BLEND_SUBS_NO},
+            {"yes", BLEND_SUBS_YES},
+            {"video", BLEND_SUBS_VIDEO})},
+        {"glsl-shaders", OPT_PATHLIST(user_shaders), .flags = M_OPT_FILE},
+        {"glsl-shader", OPT_CLI_ALIAS("glsl-shaders-append")},
+        {"glsl-shader-opts", OPT_KEYVALUELIST(user_shader_opts)},
+        {"deband", OPT_BOOL(deband)},
+        {"deband", OPT_SUBSTRUCT(deband_opts, deband_conf)},
+        {"sharpen", OPT_FLOAT(unsharp)},
+        {"gpu-tex-pad-x", OPT_INT(tex_pad_x), M_RANGE(0, 4096)},
+        {"gpu-tex-pad-y", OPT_INT(tex_pad_y), M_RANGE(0, 4096)},
+        {"", OPT_SUBSTRUCT(icc_opts, mp_icc_conf)},
+        {"gpu-shader-cache", OPT_BOOL(shader_cache)},
+        {"gpu-shader-cache-dir", OPT_STRING(shader_cache_dir), .flags = M_OPT_FILE},
+        {"gpu-hwdec-interop",
+            OPT_STRING_VALIDATE(hwdec_interop, ra_hwdec_validate_opt)},
+        {"gamut-warning", OPT_REMOVED("Replaced by --gamut-mapping-mode=warn")},
+        {"gamut-clipping", OPT_REMOVED("Replaced by --gamut-mapping-mode=desaturate")},
+        {"tone-mapping-desaturate", OPT_REMOVED("Replaced by --tone-mapping-mode")},
+        {"tone-mapping-desaturate-exponent", OPT_REMOVED("Replaced by --tone-mapping-mode")},
+        {"tone-mapping-crosstalk", OPT_REMOVED("Hard-coded as 0.04")},
+        {"tone-mapping-mode", OPT_REMOVED("no replacement")},
         {0}
     },
     .size = sizeof(struct gl_video_opts),
@@ -482,7 +508,9 @@ static struct bstr load_cached_file(struct gl_video *p, const char *path)
             return p->files[n].body;
     }
     // not found -> load it
-    struct bstr s = stream_read_file(path, p, p->global, 1000000000); // 1GB
+    char *fname = mp_get_user_path(NULL, p->global, path);
+    struct bstr s = stream_read_file(fname, p, p->global, 1000000000); // 1GB
+    talloc_free(fname);
     if (s.len) {
         struct cached_file new = {
             .path = talloc_strdup(p, path),
@@ -581,7 +609,7 @@ struct mp_colorspace gl_video_get_output_colorspace(struct gl_video *p)
     return (struct mp_colorspace) {
         .primaries = p->opts.target_prim,
         .gamma = p->opts.target_trc,
-        .sig_peak = p->opts.target_peak / MP_REF_WHITE,
+        .hdr.max_luma = p->opts.target_peak,
     };
 }
 
@@ -646,6 +674,11 @@ static bool gl_video_get_lut3d(struct gl_video *p, enum mp_csp_prim prim,
         p->lut_3d_size[i] = lut3d->size[i];
 
     talloc_free(lut3d);
+
+    if (!p->lut_3d_texture) {
+        p->use_lut_3d = false;
+        return false;
+    }
 
     return true;
 }
@@ -749,19 +782,12 @@ static void pass_get_images(struct gl_video *p, struct video_image *vimg,
         chroma.t[1] = ls_h < 1 ? ls_h * -cy / 2 : 0;
     }
 
-    int msb_valid_bits =
-        p->ra_format.component_bits + MPMIN(p->ra_format.component_pad, 0);
-    // The existing code assumes we just have a single tex multiplier for
-    // all of the planes. This may change in the future
-    float tex_mul = 1.0 / mp_get_csp_mul(p->image_params.color.space,
-                                         msb_valid_bits,
-                                         p->ra_format.component_bits);
-
     memset(img, 0, 4 * sizeof(img[0]));
     for (int n = 0; n < p->plane_count; n++) {
         struct texplane *t = &vimg->planes[n];
 
         enum plane_type type = PLANE_NONE;
+        int padding = 0;
         for (int i = 0; i < 4; i++) {
             int c = p->ra_format.components[n][i];
             enum plane_type ctype;
@@ -777,7 +803,17 @@ static void pass_get_images(struct gl_video *p, struct video_image *vimg,
                 ctype = c == 1 ? PLANE_LUMA : PLANE_CHROMA;
             }
             type = merge_plane_types(type, ctype);
+            if (!c && padding == i)
+                padding = i + 1;
         }
+
+        int msb_valid_bits =
+            p->ra_format.component_bits + MPMIN(p->ra_format.component_pad, 0);
+        int csp = type == PLANE_ALPHA ? MP_CSP_RGB : p->image_params.color.space;
+        float tex_mul =
+            1.0 / mp_get_csp_mul(csp, msb_valid_bits, p->ra_format.component_bits);
+        if (p->ra_format.component_type == RA_CTYPE_FLOAT)
+            tex_mul = 1.0;
 
         img[n] = (struct image){
             .type = type,
@@ -785,6 +821,7 @@ static void pass_get_images(struct gl_video *p, struct video_image *vimg,
             .multiplier = tex_mul,
             .w = t->w,
             .h = t->h,
+            .padding = padding,
         };
 
         for (int i = 0; i < 4; i++)
@@ -846,14 +883,7 @@ static void init_video(struct gl_video *p)
 {
     p->use_integer_conversion = false;
 
-    struct ra_hwdec *hwdec = NULL;
-    for (int n = 0; n < p->num_hwdecs; n++) {
-        if (ra_hwdec_test_format(p->hwdecs[n], p->image_params.imgfmt)) {
-            hwdec = p->hwdecs[n];
-            break;
-        }
-    }
-
+    struct ra_hwdec *hwdec = ra_hwdec_get(&p->hwdec_ctx, p->image_params.imgfmt);
     if (hwdec) {
         if (hwdec->driver->overlay_frame) {
             MP_WARN(p, "Using HW-overlay mode. No GL filtering is performed "
@@ -931,9 +961,6 @@ static void init_video(struct gl_video *p)
                        params.w, params.h);
 
             plane->tex = ra_tex_create(p->ra, &params);
-            if (!plane->tex)
-                abort(); // shit happens
-
             p->use_integer_conversion |= format->ctype == RA_CTYPE_UINT;
         }
     }
@@ -1035,9 +1062,6 @@ static void uninit_video(struct gl_video *p)
     p->hwdec_active = false;
     p->hwdec_overlay = NULL;
     ra_hwdec_mapper_free(&p->hwdec_mapper);
-
-    for (int n = 0; n < 2; n++)
-        ra_tex_free(p->ra, &p->vdpau_deinterleave_tex[n]);
 }
 
 static void pass_record(struct gl_video *p, struct mp_pass_perf perf)
@@ -1173,16 +1197,8 @@ static void dispatch_compute(struct gl_video *p, int w, int h,
         if (!s->tex)
             continue;
 
-        // We need to rescale the coordinates to the true texture size
-        char *tex_scale = mp_tprintf(32, "tex_scale%d", n);
-        gl_sc_uniform_vec2(p->sc, tex_scale, (float[2]){
-                (float)s->w / s->tex->params.w,
-                (float)s->h / s->tex->params.h,
-        });
-
-        PRELUDE("#define texmap%d_raw(id) (tex_scale%d * outcoord(id))\n", n, n);
-        PRELUDE("#define texmap%d(id) (texture_rot%d * texmap%d_raw(id) + "
-               "pixel_size%d * texture_off%d)\n", n, n, n, n, n);
+        PRELUDE("#define texmap%d(id) (texture_rot%d * outcoord(id) + "
+               "pixel_size%d * texture_off%d)\n", n, n, n, n);
         PRELUDE("#define texcoord%d texmap%d(gl_GlobalInvocationID)\n", n, n);
     }
 
@@ -1285,8 +1301,11 @@ static void finish_pass_tex(struct gl_video *p, struct ra_tex **dst_tex,
 
     // If RA_CAP_PARALLEL_COMPUTE is set, try to prefer compute shaders
     // over fragment shaders wherever possible.
-    if (!p->pass_compute.active && (p->ra->caps & RA_CAP_PARALLEL_COMPUTE))
+    if (!p->pass_compute.active && (p->ra->caps & RA_CAP_PARALLEL_COMPUTE) &&
+        (*dst_tex)->params.storage_dst)
+    {
         pass_is_compute(p, 16, 16, true);
+    }
 
     if (p->pass_compute.active) {
         gl_sc_uniform_image2D_wo(p->sc, "out_image", *dst_tex);
@@ -1312,18 +1331,21 @@ static const char *get_tex_swizzle(struct image *img)
 
 // Copy a texture to the vec4 color, while increasing offset. Also applies
 // the texture multiplier to the sampled color
-static void copy_image(struct gl_video *p, int *offset, struct image img)
+static void copy_image(struct gl_video *p, unsigned int *offset, struct image img)
 {
-    int count = img.components;
-    assert(*offset + count <= 4);
-
-    int id = pass_bind(p, img);
+    const unsigned int count = img.components;
     char src[5] = {0};
     char dst[5] = {0};
+
+    assert(*offset + count < sizeof(dst));
+    assert(img.padding + count < sizeof(src));
+
+    int id = pass_bind(p, img);
+
     const char *tex_fmt = get_tex_swizzle(&img);
     const char *dst_fmt = "rgba";
-    for (int i = 0; i < count; i++) {
-        src[i] = tex_fmt[i];
+    for (unsigned int i = 0; i < count; i++) {
+        src[i] = tex_fmt[img.padding + i];
         dst[i] = dst_fmt[*offset + i];
     }
 
@@ -1364,9 +1386,27 @@ static void hook_prelude(struct gl_video *p, const char *name, int id,
     GLSLHF("#define %s_map texmap%d\n", name, id);
     GLSLHF("#define %s_mul %f\n", name, img.multiplier);
 
+    char crap[5] = "";
+    snprintf(crap, sizeof(crap), "%s", get_tex_swizzle(&img));
+
+    // Remove leading padding by rotating the swizzle mask.
+    int len = strlen(crap);
+    for (int n = 0; n < img.padding; n++) {
+        if (len) {
+            char f = crap[0];
+            memmove(crap, crap + 1, len - 1);
+            crap[len - 1] = f;
+        }
+    }
+
     // Set up the sampling functions
     GLSLHF("#define %s_tex(pos) (%s_mul * vec4(texture(%s_raw, pos)).%s)\n",
-           name, name, name, get_tex_swizzle(&img));
+           name, name, name, crap);
+
+    if (p->ra->caps & RA_CAP_GATHER) {
+        GLSLHF("#define %s_gather(pos, c) (%s_mul * vec4("
+               "textureGather(%s_raw, pos, c)))\n", name, name, name);
+    }
 
     // Since the extra matrix multiplication impacts performance,
     // skip it unless the texture was actually rotated
@@ -1668,25 +1708,46 @@ static void reinit_scaler(struct gl_video *p, struct scaler *scaler,
 
     uninit_scaler(p, scaler);
 
-    scaler->conf = *conf;
+    if (conf && scaler->index == SCALER_DSCALE && (!conf->kernel.name ||
+        !conf->kernel.name[0]))
+    {
+        conf = &p->opts.scaler[SCALER_SCALE];
+    }
+
+    if (conf && scaler->index == SCALER_CSCALE && (!conf->kernel.name ||
+        !conf->kernel.name[0]))
+    {
+        conf = &p->opts.scaler[SCALER_SCALE];
+    }
+
+    struct filter_kernel bare_window;
+    const struct filter_kernel *t_kernel = mp_find_filter_kernel(conf->kernel.name);
+    const struct filter_window *t_window = mp_find_filter_window(conf->window.name);
     bool is_tscale = scaler->index == SCALER_TSCALE;
+    if (!t_kernel) {
+        const struct filter_window *window = mp_find_filter_window(conf->kernel.name);
+        if (window) {
+            bare_window = (struct filter_kernel) { .f = *window };
+            t_kernel = &bare_window;
+        }
+    }
+
+    scaler->conf = *conf;
     scaler->conf.kernel.name = (char *)handle_scaler_opt(conf->kernel.name, is_tscale);
-    scaler->conf.window.name = (char *)handle_scaler_opt(conf->window.name, is_tscale);
+    scaler->conf.window.name = t_window ? (char *)t_window->name : NULL;
     scaler->scale_factor = scale_factor;
     scaler->insufficient = false;
     scaler->initialized = true;
-
-    const struct filter_kernel *t_kernel = mp_find_filter_kernel(conf->kernel.name);
     if (!t_kernel)
         return;
 
     scaler->kernel_storage = *t_kernel;
     scaler->kernel = &scaler->kernel_storage;
 
-    const char *win = conf->window.name;
-    if (!win || !win[0])
-        win = t_kernel->window; // fall back to the scaler's default window
-    const struct filter_window *t_window = mp_find_filter_window(win);
+    if (!t_window) {
+        // fall back to the scaler's default window if available
+        t_window = mp_find_filter_window(t_kernel->window);
+    }
     if (t_window)
         scaler->kernel->w = *t_window;
 
@@ -1711,8 +1772,6 @@ static void reinit_scaler(struct gl_video *p, struct scaler *scaler,
         scaler->kernel->f.radius = conf->radius;
 
     scaler->kernel->clamp = conf->clamp;
-    scaler->kernel->value_cutoff = conf->cutoff;
-
     scaler->insufficient = !mp_init_filter(scaler->kernel, sizes, scale_factor);
 
     int size = scaler->kernel->size;
@@ -1724,17 +1783,16 @@ static void reinit_scaler(struct gl_video *p, struct scaler *scaler,
     int stride = width * num_components;
     assert(size <= stride);
 
-    scaler->lut_size = 1 << p->opts.scaler_lut_size;
-
-    float *weights = talloc_array(NULL, float, scaler->lut_size * stride);
-    mp_compute_lut(scaler->kernel, scaler->lut_size, stride, weights);
+    static const int lut_size = 256;
+    float *weights = talloc_array(NULL, float, lut_size * stride);
+    mp_compute_lut(scaler->kernel, lut_size, stride, weights);
 
     bool use_1d = scaler->kernel->polar && (p->ra->caps & RA_CAP_TEX_1D);
 
     struct ra_tex_params lut_params = {
         .dimensions = use_1d ? 1 : 2,
-        .w = use_1d ? scaler->lut_size : width,
-        .h = use_1d ? 1 : scaler->lut_size,
+        .w = use_1d ? lut_size : width,
+        .h = use_1d ? 1 : lut_size,
         .d = 1,
         .format = fmt,
         .render_src = true,
@@ -1864,8 +1922,7 @@ static void pass_sample(struct gl_video *p, struct image img,
     } else if (scaler->kernel) {
         pass_sample_separated(p, img, scaler, w, h);
     } else {
-        // Should never happen
-        abort();
+        MP_ASSERT_UNREACHABLE(); // should never happen
     }
 
     // Apply any required multipliers. Separated scaling already does this in
@@ -2229,6 +2286,13 @@ static void pass_read_video(struct gl_video *p)
             continue;
 
         const struct scaler_config *conf = &p->opts.scaler[scaler_id];
+
+        if (scaler_id == SCALER_CSCALE && (!conf->kernel.name ||
+            !conf->kernel.name[0]))
+        {
+            conf = &p->opts.scaler[SCALER_SCALE];
+        }
+
         struct scaler *scaler = &p->scaler[scaler_id];
 
         // bilinear scaling is a free no-op thanks to GPU sampling
@@ -2268,6 +2332,7 @@ static void pass_convert_yuv(struct gl_video *p)
 
     struct mp_csp_params cparams = MP_CSP_PARAMS_DEFAULTS;
     cparams.gray = p->is_gray;
+    cparams.is_float = p->ra_format.component_type == RA_CTYPE_FLOAT;
     mp_csp_set_image_params(&cparams, &p->image_params);
     mp_csp_equalizer_state_get(p->video_eq, &cparams);
     p->user_gamma = 1.0 / (cparams.gamma * p->opts.gamma);
@@ -2279,7 +2344,7 @@ static void pass_convert_yuv(struct gl_video *p)
 
     // Pre-colormatrix input gamma correction
     if (cparams.color.space == MP_CSP_XYZ)
-        GLSL(color.rgb = pow(color.rgb, vec3(2.6));) // linear light
+        pass_linearize(p->sc, p->image_params.color.gamma);
 
     // We always explicitly normalize the range in pass_read_video
     cparams.input_bits = cparams.texture_bits = 0;
@@ -2293,6 +2358,13 @@ static void pass_convert_yuv(struct gl_video *p)
 
     GLSL(color.rgb = mat3(colormatrix) * color.rgb + colormatrix_c;)
 
+    if (cparams.color.space == MP_CSP_XYZ) {
+        pass_delinearize(p->sc, p->image_params.color.gamma);
+        // mp_get_csp_matrix implicitly converts XYZ to DCI-P3
+        p->image_params.color.space = MP_CSP_RGB;
+        p->image_params.color.primaries = MP_CSP_PRIM_DCI_P3;
+    }
+
     if (p->image_params.color.space == MP_CSP_BT_2020_C) {
         // Conversion for C'rcY'cC'bc via the BT.2020 CL system:
         // C'bc = (B'-Y'c) / 1.9404  | C'bc <= 0
@@ -2304,34 +2376,39 @@ static void pass_convert_yuv(struct gl_video *p)
         // as per the BT.2020 specification, table 4. This is a non-linear
         // transformation because (constant) luminance receives non-equal
         // contributions from the three different channels.
-        GLSLF("// constant luminance conversion\n");
-        GLSL(color.br = color.br * mix(vec2(1.5816, 0.9936),
-                                       vec2(1.9404, 1.7184),
-                                       lessThanEqual(color.br, vec2(0)))
-                        + color.gg;)
+        GLSLF("// constant luminance conversion \n"
+              "color.br = color.br * mix(vec2(1.5816, 0.9936),              \n"
+              "                         vec2(1.9404, 1.7184),               \n"
+              "                         %s(lessThanEqual(color.br, vec2(0))))\n"
+              "          + color.gg;                                        \n",
+              gl_sc_bvec(p->sc, 2));
         // Expand channels to camera-linear light. This shader currently just
         // assumes everything uses the BT.2020 12-bit gamma function, since the
         // difference between 10 and 12-bit is negligible for anything other
         // than 12-bit content.
-        GLSL(color.rgb = mix(color.rgb * vec3(1.0/4.5),
-                             pow((color.rgb + vec3(0.0993))*vec3(1.0/1.0993),
-                                 vec3(1.0/0.45)),
-                             lessThanEqual(vec3(0.08145), color.rgb));)
+        GLSLF("color.rgb = mix(color.rgb * vec3(1.0/4.5),                       \n"
+              "                pow((color.rgb + vec3(0.0993))*vec3(1.0/1.0993), \n"
+              "                    vec3(1.0/0.45)),                             \n"
+              "                %s(lessThanEqual(vec3(0.08145), color.rgb)));    \n",
+              gl_sc_bvec(p->sc, 3));
         // Calculate the green channel from the expanded RYcB
         // The BT.2020 specification says Yc = 0.2627*R + 0.6780*G + 0.0593*B
         GLSL(color.g = (color.g - 0.2627*color.r - 0.0593*color.b)*1.0/0.6780;)
         // Recompress to receive the R'G'B' result, same as other systems
-        GLSL(color.rgb = mix(color.rgb * vec3(4.5),
-                             vec3(1.0993) * pow(color.rgb, vec3(0.45)) - vec3(0.0993),
-                             lessThanEqual(vec3(0.0181), color.rgb));)
+        GLSLF("color.rgb = mix(color.rgb * vec3(4.5),                       \n"
+              "                vec3(1.0993) * pow(color.rgb, vec3(0.45)) - vec3(0.0993), \n"
+              "                %s(lessThanEqual(vec3(0.0181), color.rgb))); \n",
+              gl_sc_bvec(p->sc, 3));
     }
 
     p->components = 3;
     if (!p->has_alpha || p->opts.alpha_mode == ALPHA_NO) {
         GLSL(color.a = 1.0;)
-    } else { // alpha present in image
+    } else if (p->image_params.alpha == MP_ALPHA_PREMUL) {
         p->components = 4;
-        GLSL(color = vec4(color.rgb * color.a, color.a);)
+    } else {
+        p->components = 4;
+        GLSL(color = vec4(color.rgb * color.a, color.a);) // straight -> premul
     }
 }
 
@@ -2473,18 +2550,43 @@ static void pass_scale_main(struct gl_video *p)
 // rendering)
 // If OSD is true, ignore any changes that may have been made to the video
 // by previous passes (i.e. linear scaling)
-static void pass_colormanage(struct gl_video *p, struct mp_colorspace src, bool osd)
+static void pass_colormanage(struct gl_video *p, struct mp_colorspace src,
+                             struct mp_colorspace fbo_csp, bool osd)
 {
     struct ra *ra = p->ra;
 
-    // Figure out the target color space from the options, or auto-guess if
-    // none were set
+    // Configure the destination according to the FBO color space,
+    // unless specific transfer function, primaries or target peak
+    // is set. If values are set to _AUTO, the most likely intended
+    // values are guesstimated later in this function.
     struct mp_colorspace dst = {
-        .gamma = p->opts.target_trc,
-        .primaries = p->opts.target_prim,
+        .gamma = p->opts.target_trc == MP_CSP_TRC_AUTO ?
+                 fbo_csp.gamma : p->opts.target_trc,
+        .primaries = p->opts.target_prim == MP_CSP_PRIM_AUTO ?
+                     fbo_csp.primaries : p->opts.target_prim,
         .light = MP_CSP_LIGHT_DISPLAY,
-        .sig_peak = p->opts.target_peak / MP_REF_WHITE,
+        .hdr.max_luma = !p->opts.target_peak ?
+                        fbo_csp.hdr.max_luma : p->opts.target_peak,
     };
+
+    if (!p->colorspace_override_warned &&
+        ((fbo_csp.gamma && dst.gamma != fbo_csp.gamma) ||
+         (fbo_csp.primaries && dst.primaries != fbo_csp.primaries)))
+    {
+        MP_WARN(p, "One or more colorspace value is being overridden "
+                   "by user while the FBO provides colorspace information: "
+                   "transfer function: (dst: %s, fbo: %s), "
+                   "primaries: (dst: %s, fbo: %s). "
+                   "Rendering can lead to incorrect results!\n",
+                m_opt_choice_str(mp_csp_trc_names,  dst.gamma),
+                m_opt_choice_str(mp_csp_trc_names,  fbo_csp.gamma),
+                m_opt_choice_str(mp_csp_prim_names, dst.primaries),
+                m_opt_choice_str(mp_csp_prim_names, fbo_csp.primaries));
+        p->colorspace_override_warned = true;
+    }
+
+    if (dst.gamma == MP_CSP_TRC_HLG)
+        dst.light = MP_CSP_LIGHT_SCENE_HLG;
 
     if (p->use_lut_3d) {
         // The 3DLUT is always generated against the video's original source
@@ -2541,14 +2643,43 @@ static void pass_colormanage(struct gl_video *p, struct mp_colorspace src, bool 
     // If there's no specific signal peak known for the output display, infer
     // it from the chosen transfer function. Also normalize the src peak, in
     // case it was unknown
-    if (!dst.sig_peak)
-        dst.sig_peak = mp_trc_nom_peak(dst.gamma);
-    if (!src.sig_peak)
-        src.sig_peak = mp_trc_nom_peak(src.gamma);
+    if (!dst.hdr.max_luma)
+        dst.hdr.max_luma = mp_trc_nom_peak(dst.gamma) * MP_REF_WHITE;
+    if (!src.hdr.max_luma)
+        src.hdr.max_luma = mp_trc_nom_peak(src.gamma) * MP_REF_WHITE;
+
+    // Whitelist supported modes
+    switch (p->opts.tone_map.curve) {
+    case TONE_MAPPING_AUTO:
+    case TONE_MAPPING_CLIP:
+    case TONE_MAPPING_MOBIUS:
+    case TONE_MAPPING_REINHARD:
+    case TONE_MAPPING_HABLE:
+    case TONE_MAPPING_GAMMA:
+    case TONE_MAPPING_LINEAR:
+    case TONE_MAPPING_BT_2390:
+        break;
+    default:
+        MP_WARN(p, "Tone mapping curve unsupported by vo_gpu, falling back.\n");
+        p->opts.tone_map.curve = TONE_MAPPING_AUTO;
+        break;
+    }
+
+    switch (p->opts.tone_map.gamut_mode) {
+    case GAMUT_AUTO:
+    case GAMUT_WARN:
+    case GAMUT_CLIP:
+    case GAMUT_DESATURATE:
+        break;
+    default:
+        MP_WARN(p, "Gamut mapping mode unsupported by vo_gpu, falling back.\n");
+        p->opts.tone_map.gamut_mode = GAMUT_AUTO;
+        break;
+    }
 
     struct gl_tone_map_opts tone_map = p->opts.tone_map;
     bool detect_peak = tone_map.compute_peak >= 0 && mp_trc_is_hdr(src.gamma)
-                       && src.sig_peak > dst.sig_peak;
+                       && src.hdr.max_luma > dst.hdr.max_luma;
 
     if (detect_peak && !p->hdr_peak_ssbo) {
         struct {
@@ -2581,6 +2712,8 @@ static void pass_colormanage(struct gl_video *p, struct mp_colorspace src, bool 
             "uint frame_max;"
             "uint counter;"
         );
+    } else {
+        tone_map.compute_peak = -1;
     }
 
     // Adapt from src to dst as necessary
@@ -2627,9 +2760,9 @@ static void pass_dither(struct gl_video *p)
 
             struct image img = image_wrap(p->error_diffusion_tex[0], PLANE_RGB, p->components);
 
-            // 1024 is minimal required number of invocation allowed in single
-            // work group in OpenGL. Use it for maximal performance.
-            int block_size = MPMIN(1024, o_h);
+            // Ensure the block size doesn't exceed the maximum of the
+            // implementation.
+            int block_size = MPMIN(p->ra->max_compute_group_threads, o_h);
 
             pass_describe(p, "dither=error-diffusion (kernel=%s, depth=%d)",
                              kernel->name, dst_depth);
@@ -2717,6 +2850,9 @@ static void pass_dither(struct gl_video *p)
         debug_check_gl(p, "dither setup");
 
         talloc_free(temp);
+
+        if (!p->dither_texture)
+            return;
     }
 
     GLSLF("// dithering\n");
@@ -2752,13 +2888,17 @@ static void pass_dither(struct gl_video *p)
 
 // Draws the OSD, in scene-referred colors.. If cms is true, subtitles are
 // instead adapted to the display's gamut.
-static void pass_draw_osd(struct gl_video *p, int draw_flags, double pts,
-                          struct mp_osd_res rect, struct ra_fbo fbo, bool cms)
+static void pass_draw_osd(struct gl_video *p, int osd_flags, int frame_flags,
+                          double pts, struct mp_osd_res rect, struct ra_fbo fbo,
+                          bool cms)
 {
-    if ((draw_flags & OSD_DRAW_SUB_ONLY) && (draw_flags & OSD_DRAW_OSD_ONLY))
+    if (frame_flags & RENDER_FRAME_VF_SUBS)
+        osd_flags |= OSD_DRAW_SUB_FILTER;
+
+    if ((osd_flags & OSD_DRAW_SUB_ONLY) && (osd_flags & OSD_DRAW_OSD_ONLY))
         return;
 
-    mpgl_osd_generate(p->osd, rect, pts, p->image_params.stereo3d, draw_flags);
+    mpgl_osd_generate(p->osd, rect, pts, p->image_params.stereo3d, osd_flags);
 
     timer_pool_start(p->osd_timer);
     for (int n = 0; n < MAX_OSD_PARTS; n++) {
@@ -2774,7 +2914,7 @@ static void pass_draw_osd(struct gl_video *p, int draw_flags, double pts,
                 .light = MP_CSP_LIGHT_DISPLAY,
             };
 
-            pass_colormanage(p, csp_srgb, true);
+            pass_colormanage(p, csp_srgb, fbo.color_space, true);
         }
         mpgl_osd_draw_finish(p->osd, n, p->sc, fbo);
     }
@@ -2871,7 +3011,7 @@ static bool pass_render_frame(struct gl_video *p, struct mp_image *mpi,
         };
         finish_pass_tex(p, &p->blend_subs_tex, rect.w, rect.h);
         struct ra_fbo fbo = { p->blend_subs_tex };
-        pass_draw_osd(p, OSD_DRAW_SUB_ONLY, vpts, rect, fbo, false);
+        pass_draw_osd(p, OSD_DRAW_SUB_ONLY, flags, vpts, rect, fbo, false);
         pass_read_tex(p, p->blend_subs_tex);
         pass_describe(p, "blend subs video");
     }
@@ -2903,7 +3043,7 @@ static bool pass_render_frame(struct gl_video *p, struct mp_image *mpi,
         }
         finish_pass_tex(p, &p->blend_subs_tex, p->texture_w, p->texture_h);
         struct ra_fbo fbo = { p->blend_subs_tex };
-        pass_draw_osd(p, OSD_DRAW_SUB_ONLY, vpts, rect, fbo, false);
+        pass_draw_osd(p, OSD_DRAW_SUB_ONLY, flags, vpts, rect, fbo, false);
         pass_read_tex(p, p->blend_subs_tex);
         pass_describe(p, "blend subs");
     }
@@ -2925,7 +3065,7 @@ static void pass_draw_to_screen(struct gl_video *p, struct ra_fbo fbo)
         GLSL(color.rgb = pow(color.rgb, vec3(user_gamma));)
     }
 
-    pass_colormanage(p, p->image_params.color, false);
+    pass_colormanage(p, p->image_params.color, fbo.color_space, false);
 
     // Since finish_pass_fbo doesn't work with compute shaders, and neither
     // does the checkerboard/dither code, we may need an indirection via
@@ -3117,7 +3257,7 @@ static void gl_video_interpolate_frame(struct gl_video *p, struct vo_frame *t,
         }
 
         if (oversample) {
-            // Oversample uses the frame area as mix ratio, not the the vsync
+            // Oversample uses the frame area as mix ratio, not the vsync
             // position itself
             double vsync_dist = t->vsync_interval / t->ideal_frame_duration,
                    threshold = tscale->conf.kernel.params[0];
@@ -3173,11 +3313,9 @@ void gl_video_render_frame(struct gl_video *p, struct vo_frame *frame,
 
     bool has_frame = !!frame->current;
 
-    if (!has_frame || !mp_rect_equals(&p->dst_rect, &target_rc)) {
-        struct m_color c = p->clear_color;
-        float color[4] = {c.r / 255.0, c.g / 255.0, c.b / 255.0, c.a / 255.0};
-        p->ra->fns->clear(p->ra, fbo.tex, color, &target_rc);
-    }
+    struct m_color c = p->clear_color;
+    float clear_color[4] = {c.r / 255.0, c.g / 255.0, c.b / 255.0, c.a / 255.0};
+    p->ra->fns->clear(p->ra, fbo.tex, clear_color, &target_rc);
 
     if (p->hwdec_overlay) {
         if (has_frame) {
@@ -3224,9 +3362,9 @@ void gl_video_render_frame(struct gl_video *p, struct vo_frame *frame,
                 // For the non-interpolation case, we draw to a single "cache"
                 // texture to speed up subsequent re-draws (if any exist)
                 struct ra_fbo dest_fbo = fbo;
-                if (frame->num_vsyncs > 1 && frame->display_synced &&
-                    !p->dumb_mode && (p->ra->caps & RA_CAP_BLIT) &&
-                    fbo.tex->params.blit_dst)
+                bool repeats = frame->num_vsyncs > 1 && frame->display_synced;
+                if ((repeats || frame->still) && !p->dumb_mode &&
+                    (p->ra->caps & RA_CAP_BLIT) && fbo.tex->params.blit_dst)
                 {
                     // Attempt to use the same format as the destination FBO
                     // if possible. Some RAs use a wrapped dummy format here,
@@ -3234,6 +3372,7 @@ void gl_video_render_frame(struct gl_video *p, struct vo_frame *frame,
                     const struct ra_format *fmt = fbo.tex->params.format;
                     if (fmt->dummy_format)
                         fmt = p->fbo_format;
+
                     bool r = ra_tex_resize(p->ra, p->log, &p->output_tex,
                                            fbo.tex->params.w, fbo.tex->params.h,
                                            fmt);
@@ -3280,7 +3419,7 @@ done:
         if (!(flags & RENDER_FRAME_OSD))
             osd_flags |= OSD_DRAW_SUB_ONLY;
 
-        pass_draw_osd(p, osd_flags, p->osd_pts, p->osd_rect, fbo, true);
+        pass_draw_osd(p, osd_flags, flags, p->osd_pts, p->osd_rect, fbo, true);
         debug_check_gl(p, "after OSD rendering");
     }
 
@@ -3325,14 +3464,24 @@ void gl_video_screenshot(struct gl_video *p, struct vo_frame *frame,
 
         int src_w = p->image_params.w;
         int src_h = p->image_params.h;
+        struct mp_rect src = {0, 0, src_w, src_h};
+        struct mp_rect dst = {0, 0, w, h};
+
+        if (mp_image_crop_valid(&p->image_params))
+            src = p->image_params.crop;
+
         if (p->image_params.rotate % 180 == 90) {
             MPSWAP(int, w, h);
             MPSWAP(int, src_w, src_h);
         }
+        mp_rect_rotate(&src, src_w, src_h, p->image_params.rotate);
+        mp_rect_rotate(&dst, w, h, p->image_params.rotate);
 
-        struct mp_rect src = {0, 0, src_w, src_h};
-        struct mp_rect dst = {0, 0, w, h};
-        struct mp_osd_res osd = {.w = w, .h = h, .display_par = 1.0};
+        struct mp_osd_res osd = {
+            .display_par = 1.0,
+            .w = mp_rect_w(dst),
+            .h = mp_rect_h(dst),
+        };
         gl_video_resize(p, &src, &dst, &osd);
     }
 
@@ -3343,6 +3492,7 @@ void gl_video_screenshot(struct gl_video *p, struct vo_frame *frame,
         .downloadable = true,
         .w = p->osd_rect.w,
         .h = p->osd_rect.h,
+        .d = 1,
         .render_dst = true,
     };
 
@@ -3389,6 +3539,7 @@ done:
     talloc_free(nframe);
     ra_tex_free(p->ra, &target);
     gl_video_resize(p, &old_src, &old_dst, &old_osd);
+    gl_video_reset_surfaces(p);
     if (!ok)
         TA_FREEP(&res);
     args->res = res;
@@ -3437,7 +3588,9 @@ static void frame_perf_data(struct pass_info pass[], struct mp_frame_perf *out)
         if (!pass[i].desc.len)
             break;
         out->perf[out->count] = pass[i].perf;
-        out->desc[out->count] = pass[i].desc.start;
+        strncpy(out->desc[out->count], pass[i].desc.start,
+                sizeof(out->desc[out->count]) - 1);
+        out->desc[out->count][sizeof(out->desc[out->count]) - 1] = '\0';
         out->count++;
     }
 }
@@ -3447,42 +3600,6 @@ void gl_video_perfdata(struct gl_video *p, struct voctrl_performance_data *out)
     *out = (struct voctrl_performance_data){0};
     frame_perf_data(p->pass_fresh,  &out->fresh);
     frame_perf_data(p->pass_redraw, &out->redraw);
-}
-
-// This assumes nv12, with textures set to GL_NEAREST filtering.
-static void reinterleave_vdpau(struct gl_video *p,
-                               struct ra_tex *input[4], struct ra_tex *output[2])
-{
-    for (int n = 0; n < 2; n++) {
-        struct ra_tex **tex = &p->vdpau_deinterleave_tex[n];
-        // This is an array of the 2 to-merge planes.
-        struct ra_tex **src = &input[n * 2];
-        int w = src[0]->params.w;
-        int h = src[0]->params.h;
-        int ids[2];
-        for (int t = 0; t < 2; t++) {
-            ids[t] = pass_bind(p, (struct image){
-                .tex = src[t],
-                .multiplier = 1.0,
-                .transform = identity_trans,
-                .w = w,
-                .h = h,
-            });
-        }
-
-        pass_describe(p, "vdpau reinterleaving");
-        GLSLF("color = fract(gl_FragCoord.y * 0.5) < 0.5\n");
-        GLSLF("      ? texture(texture%d, texcoord%d)\n", ids[0], ids[0]);
-        GLSLF("      : texture(texture%d, texcoord%d);", ids[1], ids[1]);
-
-        int comps = n == 0 ? 1 : 2;
-        const struct ra_format *fmt = ra_find_unorm_format(p->ra, 1, comps);
-        ra_tex_resize(p->ra, p->log, tex, w, h * 2, fmt);
-        struct ra_fbo fbo = { *tex };
-        finish_pass_fbo(p, fbo, true, &(struct mp_rect){0, 0, w, h * 2});
-
-        output[n] = *tex;
-    }
 }
 
 // Returns false on failure.
@@ -3521,11 +3638,6 @@ static bool pass_upload_image(struct gl_video *p, struct mp_image *mpi, uint64_t
             struct mp_image layout = {0};
             mp_image_set_params(&layout, &p->image_params);
             struct ra_tex **tex = p->hwdec_mapper->tex;
-            struct ra_tex *tmp[4] = {0};
-            if (p->hwdec_mapper->vdpau_fields) {
-                reinterleave_vdpau(p, tex, tmp);
-                tex = tmp;
-            }
             for (int n = 0; n < p->plane_count; n++) {
                 vimg->planes[n] = (struct texplane){
                     .w = mp_image_plane_w(&layout, n),
@@ -3546,6 +3658,10 @@ static bool pass_upload_image(struct gl_video *p, struct mp_image *mpi, uint64_t
     timer_pool_start(p->upload_timer);
     for (int n = 0; n < p->plane_count; n++) {
         struct texplane *plane = &vimg->planes[n];
+        if (!plane->tex) {
+            timer_pool_stop(p->upload_timer);
+            goto error;
+        }
 
         struct ra_tex_upload_params params = {
             .tex = plane->tex,
@@ -3696,6 +3812,12 @@ static void check_gl_features(struct gl_video *p)
                    "available! See your FBO format configuration!\n");
     }
 
+    if (have_compute && have_fbo && !p->fbo_format->storable) {
+        have_compute = false;
+        MP_WARN(p, "Force-disabling compute shaders as the chosen FBO format "
+                "is not storable! See your FBO format configuration!\n");
+    }
+
     if (!have_compute && p->opts.dither_algo == DITHER_ERROR_DIFFUSION) {
         MP_WARN(p, "Disabling error diffusion dithering because compute shader "
                    "was not supported. Fallback to dither=fruit instead.\n");
@@ -3721,8 +3843,18 @@ static void check_gl_features(struct gl_video *p)
                        "Most extended features will be disabled.\n");
         }
         p->dumb_mode = true;
+        static const struct scaler_config dumb_scaler_config = {
+            {"bilinear", .params = {NAN, NAN}},
+            {.params = {NAN, NAN}},
+        };
         // Most things don't work, so whitelist all options that still work.
         p->opts = (struct gl_video_opts){
+            .scaler = {
+                [SCALER_SCALE] = dumb_scaler_config,
+                [SCALER_DSCALE] = dumb_scaler_config,
+                [SCALER_CSCALE] = dumb_scaler_config,
+                [SCALER_TSCALE] = dumb_scaler_config,
+            },
             .gamma = p->opts.gamma,
             .gamma_auto = p->opts.gamma_auto,
             .pbo = p->opts.pbo,
@@ -3746,8 +3878,6 @@ static void check_gl_features(struct gl_video *p)
             .target_prim = p->opts.target_prim,
             .target_peak = p->opts.target_peak,
         };
-        for (int n = 0; n < SCALER_COUNT; n++)
-            p->opts.scaler[n] = gl_video_opts_def.scaler[n];
         if (!have_fbo)
             p->use_lut_3d = false;
         return;
@@ -3773,7 +3903,7 @@ static void check_gl_features(struct gl_video *p)
                 // p->opts is a copy => we can just mess with it.
                 p->opts.scaler[n].kernel.name = "bilinear";
                 if (n == SCALER_TSCALE)
-                    p->opts.interpolation = 0;
+                    p->opts.interpolation = false;
             }
         }
     }
@@ -3797,7 +3927,7 @@ static void check_gl_features(struct gl_video *p)
         MP_WARN(p, "Disabling color management (GLSL version too old).\n");
     }
     if (!have_mglsl && p->opts.deband) {
-        p->opts.deband = 0;
+        p->opts.deband = false;
         MP_WARN(p, "Disabling debanding (GLSL version too old).\n");
     }
 }
@@ -3822,11 +3952,7 @@ void gl_video_uninit(struct gl_video *p)
         return;
 
     uninit_video(p);
-
-    for (int n = 0; n < p->num_hwdecs; n++)
-        ra_hwdec_uninit(p->hwdecs[n]);
-    p->num_hwdecs = 0;
-
+    ra_hwdec_ctx_uninit(&p->hwdec_ctx);
     gl_sc_destroy(p->sc);
 
     ra_tex_free(p->ra, &p->lut_3d_texture);
@@ -3881,10 +4007,8 @@ bool gl_video_check_format(struct gl_video *p, int mp_format)
     if (ra_get_imgfmt_desc(p->ra, mp_format, &desc) &&
         is_imgfmt_desc_supported(p, &desc))
         return true;
-    for (int n = 0; n < p->num_hwdecs; n++) {
-        if (ra_hwdec_test_format(p->hwdecs[n], mp_format))
-            return true;
-    }
+    if (ra_hwdec_get(&p->hwdec_ctx, mp_format))
+        return true;
     return false;
 }
 
@@ -3953,6 +4077,10 @@ static const char *handle_scaler_opt(const char *name, bool tscale)
         if (kernel && (!tscale || !kernel->polar))
                 return kernel->f.name;
 
+        const struct filter_window *window = mp_find_filter_window(name);
+        if (window)
+            return window->name;
+
         for (const char *const *filter = tscale ? fixed_tscale_filters
                                                 : fixed_scale_filters;
              *filter; filter++) {
@@ -3988,17 +4116,28 @@ static void reinit_from_options(struct gl_video *p)
 
     check_gl_features(p);
     uninit_rendering(p);
-    gl_sc_set_cache_dir(p->sc, p->opts.shader_cache_dir);
+    if (p->opts.shader_cache)
+        gl_sc_set_cache_dir(p->sc, p->opts.shader_cache_dir);
     p->ra->use_pbo = p->opts.pbo;
     gl_video_setup_hooks(p);
     reinit_osd(p);
 
-    int vs;
-    mp_read_option_raw(p->global, "video-sync", &m_option_type_choice, &vs);
-    if (p->opts.interpolation && !vs && !p->dsi_warned) {
+    struct mp_vo_opts *vo_opts = mp_get_config_group(p, p->global, &vo_sub_opts);
+    if (p->opts.interpolation && !vo_opts->video_sync && !p->dsi_warned) {
         MP_WARN(p, "Interpolation now requires enabling display-sync mode.\n"
                    "E.g.: --video-sync=display-resample\n");
         p->dsi_warned = true;
+    }
+    talloc_free(vo_opts);
+
+    if (p->opts.correct_downscaling && !p->correct_downscaling_warned) {
+        const char *name = p->opts.scaler[SCALER_DSCALE].kernel.name;
+        if (!name)
+            name = p->opts.scaler[SCALER_SCALE].kernel.name;
+        if (!name || !strcmp(name, "bilinear")) {
+            MP_WARN(p, "correct-downscaling requires non-bilinear scaler.\n");
+            p->correct_downscaling_warned = true;
+        }
     }
 }
 
@@ -4030,13 +4169,18 @@ void gl_video_configure_queue(struct gl_video *p, struct vo *vo)
 }
 
 static int validate_scaler_opt(struct mp_log *log, const m_option_t *opt,
-                               struct bstr name, struct bstr param)
+                               struct bstr name, const char **value)
 {
-    char s[20] = {0};
+    struct bstr param = bstr0(*value);
+    char s[32] = {0};
     int r = 1;
     bool tscale = bstr_equals0(name, "tscale");
     if (bstr_equals0(param, "help")) {
         r = M_OPT_EXIT;
+    } else if (bstr_equals0(name, "dscale") && !param.len) {
+        return r; // empty dscale means "use same as upscaler"
+    } else if (bstr_equals0(name, "cscale") && !param.len) {
+        return r; // empty cscale means "use same as upscaler"
     } else {
         snprintf(s, sizeof(s), "%.*s", BSTR_P(param));
         if (!handle_scaler_opt(s, tscale))
@@ -4053,6 +4197,14 @@ static int validate_scaler_opt(struct mp_log *log, const m_option_t *opt,
             if (!tscale || !mp_filter_kernels[n].polar)
                 mp_info(log, "    %s\n", mp_filter_kernels[n].f.name);
         }
+        for (int n = 0; mp_filter_windows[n].name; n++) {
+            for (int m = 0; mp_filter_kernels[m].f.name; m++) {
+                if (!strcmp(mp_filter_windows[n].name, mp_filter_kernels[m].f.name))
+                    goto next_window; // don't log duplicates
+            }
+            mp_info(log, "    %s\n", mp_filter_windows[n].name);
+next_window: ;
+        }
         if (s[0])
             mp_fatal(log, "No scaler named '%s' found!\n", s);
     }
@@ -4060,12 +4212,15 @@ static int validate_scaler_opt(struct mp_log *log, const m_option_t *opt,
 }
 
 static int validate_window_opt(struct mp_log *log, const m_option_t *opt,
-                               struct bstr name, struct bstr param)
+                               struct bstr name, const char **value)
 {
-    char s[20] = {0};
+    struct bstr param = bstr0(*value);
+    char s[32] = {0};
     int r = 1;
     if (bstr_equals0(param, "help")) {
         r = M_OPT_EXIT;
+    } else if (!param.len) {
+        return r; // empty string means "use preferred window"
     } else {
         snprintf(s, sizeof(s), "%.*s", BSTR_P(param));
         const struct filter_window *window = mp_find_filter_window(s);
@@ -4083,9 +4238,10 @@ static int validate_window_opt(struct mp_log *log, const m_option_t *opt,
 }
 
 static int validate_error_diffusion_opt(struct mp_log *log, const m_option_t *opt,
-                                        struct bstr name, struct bstr param)
+                                        struct bstr name, const char **value)
 {
-    char s[20] = {0};
+    struct bstr param = bstr0(*value);
+    char s[32] = {0};
     int r = 1;
     if (bstr_equals0(param, "help")) {
         r = M_OPT_EXIT;
@@ -4103,21 +4259,6 @@ static int validate_error_diffusion_opt(struct mp_log *log, const m_option_t *op
             mp_fatal(log, "No error diffusion kernel named '%s' found!\n", s);
     }
     return r;
-}
-
-float gl_video_scale_ambient_lux(float lmin, float lmax,
-                                 float rmin, float rmax, float lux)
-{
-    assert(lmax > lmin);
-
-    float num = (rmax - rmin) * (log10(lux) - log10(lmin));
-    float den = log10(lmax) - log10(lmin);
-    float result = num / den + rmin;
-
-    // clamp the result
-    float max = MPMAX(rmax, rmin);
-    float min = MPMIN(rmax, rmin);
-    return MPMAX(MPMIN(result, max), min);
 }
 
 void gl_video_set_ambient_lux(struct gl_video *p, int lux)
@@ -4145,7 +4286,7 @@ static void *gl_video_dr_alloc_buffer(struct gl_video *p, size_t size)
     p->dr_buffers[p->num_dr_buffers++] = (struct dr_buffer){ .buf = buf };
 
     return buf->data;
-};
+}
 
 static void gl_video_dr_free_buffer(void *opaque, uint8_t *data)
 {
@@ -4161,12 +4302,19 @@ static void gl_video_dr_free_buffer(void *opaque, uint8_t *data)
         }
     }
     // not found - must not happen
-    assert(0);
+    MP_ASSERT_UNREACHABLE();
 }
 
 struct mp_image *gl_video_get_image(struct gl_video *p, int imgfmt, int w, int h,
-                                    int stride_align)
+                                    int stride_align, int flags)
 {
+    if (flags & VO_DR_FLAG_HOST_CACHED) {
+        if (p->ra->caps & RA_CAP_SLOW_DR) {
+            MP_VERBOSE(p, "DR path suspected slow/uncached, disabling.\n");
+            return NULL;
+        }
+    }
+
     if (!gl_video_check_format(p, imgfmt))
         return NULL;
 
@@ -4189,45 +4337,23 @@ struct mp_image *gl_video_get_image(struct gl_video *p, int imgfmt, int w, int h
     return res;
 }
 
-static void load_add_hwdec(struct gl_video *p, struct mp_hwdec_devices *devs,
-                           const struct ra_hwdec_driver *drv, bool is_auto)
-{
-    struct ra_hwdec *hwdec =
-        ra_hwdec_load_driver(p->ra, p->log, p->global, devs, drv, is_auto);
-    if (hwdec)
-        MP_TARRAY_APPEND(p, p->hwdecs, p->num_hwdecs, hwdec);
-}
-
-void gl_video_load_hwdecs(struct gl_video *p, struct mp_hwdec_devices *devs,
+void gl_video_init_hwdecs(struct gl_video *p, struct ra_ctx *ra_ctx,
+                          struct mp_hwdec_devices *devs,
                           bool load_all_by_default)
 {
-    char *type = p->opts.hwdec_interop;
-    if (!type || !type[0] || strcmp(type, "auto") == 0) {
-        if (!load_all_by_default)
-            return;
-        type = "all";
-    }
-    if (strcmp(type, "no") == 0) {
-        // do nothing, just block further loading
-    } else if (strcmp(type, "all") == 0) {
-        gl_video_load_hwdecs_all(p, devs);
-    } else {
-        for (int n = 0; ra_hwdec_drivers[n]; n++) {
-            const struct ra_hwdec_driver *drv = ra_hwdec_drivers[n];
-            if (strcmp(type, drv->name) == 0) {
-                load_add_hwdec(p, devs, drv, false);
-                break;
-            }
-        }
-    }
-    p->hwdec_interop_loading_done = true;
+    assert(!p->hwdec_ctx.ra_ctx);
+    p->hwdec_ctx = (struct ra_hwdec_ctx) {
+        .log = p->log,
+        .global = p->global,
+        .ra_ctx = ra_ctx,
+    };
+
+    ra_hwdec_ctx_init(&p->hwdec_ctx, devs, p->opts.hwdec_interop, load_all_by_default);
 }
 
-void gl_video_load_hwdecs_all(struct gl_video *p, struct mp_hwdec_devices *devs)
+void gl_video_load_hwdecs_for_img_fmt(struct gl_video *p, struct mp_hwdec_devices *devs,
+                                      struct hwdec_imgfmt_request *params)
 {
-    if (!p->hwdec_interop_loading_done) {
-        for (int n = 0; ra_hwdec_drivers[n]; n++)
-            load_add_hwdec(p, devs, ra_hwdec_drivers[n], true);
-        p->hwdec_interop_loading_done = true;
-    }
+    assert(p->hwdec_ctx.ra_ctx);
+    ra_hwdec_ctx_load_fmt(&p->hwdec_ctx, devs, params);
 }

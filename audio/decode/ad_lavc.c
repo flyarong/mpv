@@ -26,8 +26,11 @@
 #include <libavutil/common.h>
 #include <libavutil/intreadwrite.h>
 
+#include "config.h"
+
 #include "mpv_talloc.h"
 #include "audio/aframe.h"
+#include "audio/chmap_avchannel.h"
 #include "audio/fmt-conversion.h"
 #include "common/av_common.h"
 #include "common/codecs.h"
@@ -43,12 +46,13 @@
 struct priv {
     AVCodecContext *avctx;
     AVFrame *avframe;
+    AVPacket *avpkt;
     struct mp_chmap force_channel_map;
     uint32_t skip_samples, trim_samples;
     bool preroll_done;
     double next_pts;
     AVRational codec_timebase;
-    bool eof_returned;
+    struct lavc_state state;
 
     struct mp_decoder public;
 };
@@ -56,23 +60,22 @@ struct priv {
 #define OPT_BASE_STRUCT struct ad_lavc_params
 struct ad_lavc_params {
     float ac3drc;
-    int downmix;
+    bool downmix;
     int threads;
     char **avopts;
 };
 
 const struct m_sub_options ad_lavc_conf = {
     .opts = (const m_option_t[]) {
-        OPT_FLOATRANGE("ac3drc", ac3drc, 0, 0, 6),
-        OPT_FLAG("downmix", downmix, 0),
-        OPT_INTRANGE("threads", threads, 0, 0, 16),
-        OPT_KEYVALUELIST("o", avopts, 0),
+        {"ac3drc", OPT_FLOAT(ac3drc), M_RANGE(0, 6)},
+        {"downmix", OPT_BOOL(downmix)},
+        {"threads", OPT_INT(threads), M_RANGE(0, 16)},
+        {"o", OPT_KEYVALUELIST(avopts)},
         {0}
     },
     .size = sizeof(struct ad_lavc_params),
     .defaults = &(const struct ad_lavc_params){
         .ac3drc = 0,
-        .downmix = 1,
         .threads = 1,
     },
 };
@@ -81,11 +84,11 @@ static bool init(struct mp_filter *da, struct mp_codec_params *codec,
                  const char *decoder)
 {
     struct priv *ctx = da->priv;
-    struct MPOpts *mpopts = mp_get_config_group(ctx, da->global, GLOBAL_CONFIG);
+    struct MPOpts *mpopts = mp_get_config_group(ctx, da->global, &mp_opt_root);
     struct ad_lavc_params *opts =
         mp_get_config_group(ctx, da->global, &ad_lavc_conf);
     AVCodecContext *lavc_context;
-    AVCodec *lavc_codec;
+    const AVCodec *lavc_codec;
 
     ctx->codec_timebase = mp_get_codec_timebase(codec);
 
@@ -101,26 +104,37 @@ static bool init(struct mp_filter *da, struct mp_codec_params *codec,
     lavc_context = avcodec_alloc_context3(lavc_codec);
     ctx->avctx = lavc_context;
     ctx->avframe = av_frame_alloc();
+    ctx->avpkt = av_packet_alloc();
+    MP_HANDLE_OOM(ctx->avctx && ctx->avframe && ctx->avpkt);
     lavc_context->codec_type = AVMEDIA_TYPE_AUDIO;
     lavc_context->codec_id = lavc_codec->id;
-
-#if LIBAVCODEC_VERSION_MICRO >= 100
     lavc_context->pkt_timebase = ctx->codec_timebase;
-#endif
 
     if (opts->downmix && mpopts->audio_output_channels.num_chmaps == 1) {
+        const struct mp_chmap *requested_layout =
+            &mpopts->audio_output_channels.chmaps[0];
+#if !HAVE_AV_CHANNEL_LAYOUT
         lavc_context->request_channel_layout =
-            mp_chmap_to_lavc(&mpopts->audio_output_channels.chmaps[0]);
+            mp_chmap_to_lavc(requested_layout);
+#else
+        AVChannelLayout av_layout = { 0 };
+        mp_chmap_to_av_layout(&av_layout, requested_layout);
+
+        // Always try to set requested output layout - currently only something
+        // supported by AC3, MLP/TrueHD, DTS and the fdk-aac wrapper.
+        av_opt_set_chlayout(lavc_context, "downmix", &av_layout,
+                            AV_OPT_SEARCH_CHILDREN);
+
+        av_channel_layout_uninit(&av_layout);
+#endif
     }
 
     // Always try to set - option only exists for AC3 at the moment
     av_opt_set_double(lavc_context, "drc_scale", opts->ac3drc,
                       AV_OPT_SEARCH_CHILDREN);
 
-#if LIBAVCODEC_VERSION_MICRO >= 100
     // Let decoder add AV_FRAME_DATA_SKIP_SAMPLES.
     av_opt_set(lavc_context, "flags2", "+skip_manual", AV_OPT_SEARCH_CHILDREN);
-#endif
 
     mp_set_avopts(da->log, lavc_context, opts->avopts);
 
@@ -148,6 +162,7 @@ static void destroy(struct mp_filter *da)
 
     avcodec_free_context(&ctx->avctx);
     av_frame_free(&ctx->avframe);
+    mp_free_av_packet(&ctx->avpkt);
 }
 
 static void reset(struct mp_filter *da)
@@ -159,10 +174,10 @@ static void reset(struct mp_filter *da)
     ctx->trim_samples = 0;
     ctx->preroll_done = false;
     ctx->next_pts = MP_NOPTS_VALUE;
-    ctx->eof_returned = false;
+    ctx->state = (struct lavc_state){0};
 }
 
-static bool send_packet(struct mp_filter *da, struct demux_packet *mpkt)
+static int send_packet(struct mp_filter *da, struct demux_packet *mpkt)
 {
     struct priv *priv = da->priv;
     AVCodecContext *avctx = priv->avctx;
@@ -173,20 +188,15 @@ static bool send_packet(struct mp_filter *da, struct demux_packet *mpkt)
     if (mpkt && priv->next_pts == MP_NOPTS_VALUE)
         priv->next_pts = mpkt->pts;
 
-    AVPacket pkt;
-    mp_set_av_packet(&pkt, mpkt, &priv->codec_timebase);
+    mp_set_av_packet(priv->avpkt, mpkt, &priv->codec_timebase);
 
-    int ret = avcodec_send_packet(avctx, mpkt ? &pkt : NULL);
-
-    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-        return false;
-
+    int ret = avcodec_send_packet(avctx, mpkt ? priv->avpkt : NULL);
     if (ret < 0)
         MP_ERR(da, "Error decoding audio.\n");
-    return true;
+    return ret;
 }
 
-static bool receive_frame(struct mp_filter *da, struct mp_frame *out)
+static int receive_frame(struct mp_filter *da, struct mp_frame *out)
 {
     struct priv *priv = da->priv;
     AVCodecContext *avctx = priv->avctx;
@@ -198,25 +208,23 @@ static bool receive_frame(struct mp_filter *da, struct mp_frame *out)
         // over in case we get new packets at some point in the future.
         // (Dont' reset the filter itself, we want to keep other state.)
         avcodec_flush_buffers(priv->avctx);
-        return false;
+        return ret;
     } else if (ret < 0 && ret != AVERROR(EAGAIN)) {
         MP_ERR(da, "Error decoding audio.\n");
     }
 
-#if LIBAVCODEC_VERSION_MICRO >= 100
     if (priv->avframe->flags & AV_FRAME_FLAG_DISCARD)
         av_frame_unref(priv->avframe);
-#endif
 
     if (!priv->avframe->buf[0])
-        return true;
+        return ret;
 
     double out_pts = mp_pts_from_av(priv->avframe->pts, &priv->codec_timebase);
 
     struct mp_aframe *mpframe = mp_aframe_from_avframe(priv->avframe);
     if (!mpframe) {
         MP_ERR(da, "Converting libavcodec frame to mpv frame failed.\n");
-        return true;
+        return ret;
     }
 
     if (priv->force_channel_map.num)
@@ -228,7 +236,6 @@ static bool receive_frame(struct mp_filter *da, struct mp_frame *out)
 
     priv->next_pts = mp_aframe_end_pts(mpframe);
 
-#if LIBAVCODEC_VERSION_MICRO >= 100
     AVFrameSideData *sd =
         av_frame_get_side_data(priv->avframe, AV_FRAME_DATA_SKIP_SAMPLES);
     if (sd && sd->size >= 10) {
@@ -236,7 +243,6 @@ static bool receive_frame(struct mp_filter *da, struct mp_frame *out)
         priv->skip_samples += AV_RL32(d + 0);
         priv->trim_samples += AV_RL32(d + 4);
     }
-#endif
 
     if (!priv->preroll_done) {
         // Skip only if this isn't already handled by AV_FRAME_DATA_SKIP_SAMPLES.
@@ -256,6 +262,9 @@ static bool receive_frame(struct mp_filter *da, struct mp_frame *out)
         priv->trim_samples -= trim;
     }
 
+    // Strip possibly bogus float values like Infinity, NaN, denormalized
+    mp_aframe_sanitize_float(mpframe);
+
     if (mp_aframe_get_size(mpframe) > 0) {
         *out = MAKE_FRAME(MP_FRAME_AUDIO, mpframe);
     } else {
@@ -264,14 +273,14 @@ static bool receive_frame(struct mp_filter *da, struct mp_frame *out)
 
     av_frame_unref(priv->avframe);
 
-    return true;
+    return ret;
 }
 
 static void process(struct mp_filter *ad)
 {
     struct priv *priv = ad->priv;
 
-    lavc_process(ad, &priv->eof_returned, send_packet, receive_frame);
+    lavc_process(ad, &priv->state, send_packet, receive_frame);
 }
 
 static const struct mp_filter_info ad_lavc_filter = {

@@ -17,15 +17,12 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "config.h"
-
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <signal.h>
 #include <errno.h>
 #include <sys/ioctl.h>
-#include <pthread.h>
 #include <assert.h>
 
 #include <termios.h>
@@ -33,7 +30,7 @@
 
 #include "osdep/io.h"
 #include "osdep/threads.h"
-#include "osdep/polldev.h"
+#include "osdep/poll_wrapper.h"
 
 #include "common/common.h"
 #include "misc/bstr.h"
@@ -42,8 +39,18 @@
 #include "misc/ctype.h"
 #include "terminal.h"
 
-static volatile struct termios tio_orig;
-static volatile int tio_orig_set;
+// Timeout in ms after which the (normally ambiguous) ESC key is detected.
+#define ESC_TIMEOUT 100
+
+// Timeout in ms after which the poll for input is aborted. The FG/BG state is
+// tested before every wait, and a positive value allows reactivating input
+// processing when mpv is brought to the foreground while it was running in the
+// background. In such a situation, an infinite timeout (-1) will keep mpv
+// waiting for input without realizing the terminal state changed - and thus
+// buffer all keypresses until ENTER is pressed.
+#define INPUT_TIMEOUT 1000
+
+static struct termios tio_orig;
 
 static int tty_in = -1, tty_out = -1;
 
@@ -84,6 +91,10 @@ static const struct key_entry keys[] = {
     {"\033[23~", MP_KEY_F+11},
     {"\033[24~", MP_KEY_F+12},
 
+    {"\033OA", MP_KEY_UP},
+    {"\033OB", MP_KEY_DOWN},
+    {"\033OC", MP_KEY_RIGHT},
+    {"\033OD", MP_KEY_LEFT},
     {"\033[A", MP_KEY_UP},
     {"\033[B", MP_KEY_DOWN},
     {"\033[C", MP_KEY_RIGHT},
@@ -171,22 +182,18 @@ static void skip_buf(struct termbuf *b, unsigned int count)
 
 static struct termbuf buf;
 
-static bool getch2(struct input_ctx *input_ctx)
+static void process_input(struct input_ctx *input_ctx, bool timeout)
 {
-    int retval = read(tty_in, &buf.b[buf.len], BUF_LEN - buf.len);
-    /* Return false on EOF to stop running select() on the FD, as it'd
-     * trigger all the time. Note that it's possible to get temporary
-     * EOF on terminal if the user presses ctrl-d, but that shouldn't
-     * happen if the terminal state change done in terminal_init()
-     * works.
-     */
-    if (retval == 0)
-        return false;
-    if (retval == -1)
-        return errno != EBADF && errno != EINVAL;
-    buf.len += retval;
-
     while (buf.len) {
+        // Lone ESC is ambiguous, so accept it only after a timeout.
+        if (timeout &&
+            ((buf.len == 1 && buf.b[0] == '\033') ||
+             (buf.len > 1 && buf.b[0] == '\033' && buf.b[1] == '\033')))
+        {
+            mp_input_put_key(input_ctx, MP_KEY_ESC);
+            skip_buf(&buf, 1);
+        }
+
         int utf8_len = bstr_parse_utf8_code_length(buf.b[0]);
         if (utf8_len > 1) {
             if (buf.len < utf8_len)
@@ -208,23 +215,38 @@ static bool getch2(struct input_ctx *input_ctx)
         }
 
         if (!match) { // normal or unknown key
+            int mods = 0;
             if (buf.b[0] == '\033') {
+                if (buf.len > 1 && buf.b[1] == '[') {
+                    // unknown CSI sequence. wait till it completes
+                    for (int i = 2; i < buf.len; i++) {
+                        if (buf.b[i] >= 0x40 && buf.b[i] <= 0x7E)  {
+                            skip_buf(&buf, i+1);
+                            continue;  // complete - throw it away
+                        }
+                    }
+                    goto read_more;  // not yet complete
+                }
+                // non-CSI esc sequence
                 skip_buf(&buf, 1);
-                if (buf.len > 0 && mp_isalnum(buf.b[0])) { // meta+normal key
-                    mp_input_put_key(input_ctx, buf.b[0] | MP_KEY_MODIFIER_ALT);
-                    skip_buf(&buf, 1);
-                } else if (buf.len == 1 && buf.b[0] == '\033') {
-                    mp_input_put_key(input_ctx, MP_KEY_ESC);
-                    skip_buf(&buf, 1);
+                if (buf.len > 0 && buf.b[0] > 0 && buf.b[0] < 127) {
+                    // meta+normal key
+                    mods |= MP_KEY_MODIFIER_ALT;
                 } else {
                     // Throw it away. Typically, this will be a complete,
                     // unsupported sequence, and dropping this will skip it.
                     skip_buf(&buf, buf.len);
+                    continue;
                 }
-            } else {
-                mp_input_put_key(input_ctx, buf.b[0]);
-                skip_buf(&buf, 1);
             }
+            unsigned char c = buf.b[0];
+            skip_buf(&buf, 1);
+            if (c < 32) {
+                // 1..26 is ^A..^Z, and 27..31 is ^3..^7
+                c = c <= 26 ? (c + 'a' - 1) : (c + '3' - 27);
+                mods |= MP_KEY_MODIFIER_CTRL;
+            }
+            mp_input_put_key(input_ctx, c | mods);
             continue;
         }
 
@@ -246,12 +268,11 @@ static bool getch2(struct input_ctx *input_ctx)
         skip_buf(&buf, seq_len);
     }
 
-read_more:  /* need more bytes */
-    return true;
+read_more: ;  /* need more bytes */
 }
 
-static volatile int getch2_active  = 0;
-static volatile int getch2_enabled = 0;
+static int getch2_active  = 0;
+static int getch2_enabled = 0;
 static bool read_terminal;
 
 static void enable_kx(bool enable)
@@ -277,11 +298,6 @@ static void do_activate_getch2(void)
     struct termios tio_new;
     tcgetattr(tty_in,&tio_new);
 
-    if (!tio_orig_set) {
-        tio_orig = tio_new;
-        tio_orig_set = 1;
-    }
-
     tio_new.c_lflag &= ~(ICANON|ECHO); /* Clear ICANON and ECHO. */
     tio_new.c_cc[VMIN] = 1;
     tio_new.c_cc[VTIME] = 0;
@@ -296,12 +312,7 @@ static void do_deactivate_getch2(void)
         return;
 
     enable_kx(false);
-
-    if (tio_orig_set) {
-        // once set, it will never be set again
-        // so we can cast away volatile here
-        tcsetattr(tty_in, TCSANOW, (const struct termios *) &tio_orig);
-    }
+    tcsetattr(tty_in, TCSANOW, &tio_orig);
 
     getch2_active = 0;
 }
@@ -337,9 +348,17 @@ static void getch2_poll(void)
         do_deactivate_getch2();
 }
 
+static mp_thread input_thread;
+static struct input_ctx *input_ctx;
+static int death_pipe[2] = {-1, -1};
+enum { PIPE_STOP, PIPE_CONT };
+static int stop_cont_pipe[2] = {-1, -1};
+
 static void stop_sighandler(int signum)
 {
-    do_deactivate_getch2();
+    int saved_errno = errno;
+    (void)write(stop_cont_pipe[1], &(char){PIPE_STOP}, 1);
+    errno = saved_errno;
 
     // note: for this signal, we use SA_RESETHAND but do NOT mask signals
     // so this will invoke the default handler
@@ -348,22 +367,26 @@ static void stop_sighandler(int signum)
 
 static void continue_sighandler(int signum)
 {
+    int saved_errno = errno;
     // SA_RESETHAND has reset SIGTSTP, so we need to restore it here
     setsigaction(SIGTSTP, stop_sighandler, SA_RESETHAND, false);
 
-    getch2_poll();
+    (void)write(stop_cont_pipe[1], &(char){PIPE_CONT}, 1);
+    errno = saved_errno;
 }
 
-static pthread_t input_thread;
-static struct input_ctx *input_ctx;
-static int death_pipe[2] = {-1, -1};
+static void safe_close(int *p)
+{
+    if (*p >= 0)
+        close(*p);
+    *p = -1;
+}
 
-static void close_death_pipe(void)
+static void close_sig_pipes(void)
 {
     for (int n = 0; n < 2; n++) {
-        if (death_pipe[n] >= 0)
-            close(death_pipe[n]);
-        death_pipe[n] = -1;
+        safe_close(&death_pipe[n]);
+        safe_close(&stop_cont_pipe[n]);
     }
 }
 
@@ -377,28 +400,57 @@ static void close_tty(void)
 
 static void quit_request_sighandler(int signum)
 {
-    do_deactivate_getch2();
-
+    int saved_errno = errno;
     (void)write(death_pipe[1], &(char){1}, 1);
+    errno = saved_errno;
 }
 
-static void *terminal_thread(void *ptr)
+static MP_THREAD_VOID terminal_thread(void *ptr)
 {
-    mpthread_set_name("terminal");
+    mp_thread_set_name("terminal/input");
     bool stdin_ok = read_terminal; // if false, we still wait for SIGTERM
     while (1) {
         getch2_poll();
-        struct pollfd fds[2] = {
+        struct pollfd fds[3] = {
             { .events = POLLIN, .fd = death_pipe[0] },
+            { .events = POLLIN, .fd = stop_cont_pipe[0] },
             { .events = POLLIN, .fd = tty_in }
         };
-        polldev(fds, stdin_ok ? 2 : 1, -1);
-        if (fds[0].revents)
+        /*
+         * if the process isn't in foreground process group, then on macos
+         * polldev() doesn't rest and gets into 100% cpu usage (see issue #11795)
+         * with read() returning EIO. but we shouldn't quit on EIO either since
+         * the process might be foregrounded later.
+         *
+         * so just avoid poll-ing tty_in when we know the process is not in the
+         * foreground. there's a small race window, but the timeout will take
+         * care of it so it's fine.
+         */
+        bool is_fg = tcgetpgrp(tty_in) == getpgrp();
+        int r = polldev(fds, stdin_ok && is_fg ? 3 : 2, buf.len ? ESC_TIMEOUT : INPUT_TIMEOUT);
+        if (fds[0].revents) {
+            do_deactivate_getch2();
             break;
-        if (fds[1].revents) {
-            if (!getch2(input_ctx))
-                break;
         }
+        if (fds[1].revents & POLLIN) {
+            int8_t c = -1;
+            (void)read(stop_cont_pipe[0], &c, 1);
+            if (c == PIPE_STOP)
+                do_deactivate_getch2();
+            else if (c == PIPE_CONT)
+                getch2_poll();
+        }
+        if (fds[2].revents) {
+            int retval = read(tty_in, &buf.b[buf.len], BUF_LEN - buf.len);
+            if (!retval || (retval == -1 && errno != EINTR && errno != EAGAIN && errno != EIO))
+                break; // EOF/closed
+            if (retval > 0) {
+                buf.len += retval;
+                process_input(input_ctx, false);
+            }
+        }
+        if (r == 0)
+            process_input(input_ctx, true);
     }
     char c;
     bool quit = read(death_pipe[0], &c, 1) == 1 && c == 1;
@@ -408,7 +460,7 @@ static void *terminal_thread(void *ptr)
         if (cmd)
             mp_input_queue_cmd(input_ctx, cmd);
     }
-    return NULL;
+    MP_THREAD_RETURN();
 }
 
 void terminal_setup_getch(struct input_ctx *ictx)
@@ -418,6 +470,10 @@ void terminal_setup_getch(struct input_ctx *ictx)
 
     if (mp_make_wakeup_pipe(death_pipe) < 0)
         return;
+    if (mp_make_wakeup_pipe(stop_cont_pipe) < 0) {
+        close_sig_pipes();
+        return;
+    }
 
     // Disable reading from the terminal even if stdout is not a tty, to make
     //   mpv ... | less
@@ -426,9 +482,9 @@ void terminal_setup_getch(struct input_ctx *ictx)
 
     input_ctx = ictx;
 
-    if (pthread_create(&input_thread, NULL, terminal_thread, NULL)) {
+    if (mp_thread_create(&input_thread, terminal_thread, NULL)) {
         input_ctx = NULL;
-        close_death_pipe();
+        close_sig_pipes();
         close_tty();
         return;
     }
@@ -454,8 +510,8 @@ void terminal_uninit(void)
 
     if (input_ctx) {
         (void)write(death_pipe[1], &(char){0}, 1);
-        pthread_join(input_thread, NULL);
-        close_death_pipe();
+        mp_thread_join(input_thread);
+        close_sig_pipes();
         input_ctx = NULL;
     }
 
@@ -481,6 +537,19 @@ void terminal_get_size(int *w, int *h)
     *h = ws.ws_row;
 }
 
+void terminal_get_size2(int *rows, int *cols, int *px_width, int *px_height)
+{
+    struct winsize ws;
+    if (ioctl(tty_in, TIOCGWINSZ, &ws) < 0 || !ws.ws_row || !ws.ws_col
+                                           || !ws.ws_xpixel || !ws.ws_ypixel)
+        return;
+
+    *rows = ws.ws_row;
+    *cols = ws.ws_col;
+    *px_width = ws.ws_xpixel;
+    *px_height = ws.ws_ypixel;
+}
+
 void terminal_init(void)
 {
     assert(!getch2_enabled);
@@ -491,6 +560,8 @@ void terminal_init(void)
         tty_in = STDIN_FILENO;
         tty_out = STDOUT_FILENO;
     }
+
+    tcgetattr(tty_in, &tio_orig);
 
     // handlers to fix terminal settings
     setsigaction(SIGCONT, continue_sighandler, 0, true);

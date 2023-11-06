@@ -105,7 +105,17 @@ int mp_closedir(DIR *dir);
 int mp_mkdir(const char *path, int mode);
 char *mp_win32_getcwd(char *buf, size_t size);
 char *mp_getenv(const char *name);
+
+#ifdef environ  /* mingw defines it as _environ */
+#undef environ
+#endif
+#define environ (*mp_penviron())  /* ensure initialization and l-value */
+char ***mp_penviron(void);
+
 off_t mp_lseek(int fd, off_t offset, int whence);
+void *mp_dlopen(const char *filename, int flag);
+void *mp_dlsym(void *handle, const char *symbol);
+char *mp_dlerror(void);
 
 // mp_stat types. MSVCRT's dev_t and ino_t are way too short to be unique.
 typedef uint64_t mp_dev_t_;
@@ -165,12 +175,21 @@ void mp_globfree(mp_glob_t *pglob);
 #undef lseek
 #define lseek(...) mp_lseek(__VA_ARGS__)
 
+#define RTLD_NOW 0
+#define RTLD_LOCAL 0
+#define dlopen(fn,fg) mp_dlopen((fn), (fg))
+#define dlsym(h,s) mp_dlsym((h), (s))
+#define dlerror mp_dlerror
+
 // Affects both "stat()" and "struct stat".
 #undef stat
 #define stat mp_stat
 
 #undef fstat
 #define fstat(...) mp_fstat(__VA_ARGS__)
+
+#define utime(...) _utime(__VA_ARGS__)
+#define utimbuf _utimbuf
 
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
 int munmap(void *addr, size_t length);
@@ -201,6 +220,8 @@ void freelocale(locale_t);
 #else /* __MINGW32__ */
 
 #include <sys/mman.h>
+
+extern char **environ;
 
 #endif /* __MINGW32__ */
 

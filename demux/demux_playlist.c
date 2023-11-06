@@ -20,11 +20,14 @@
 #include <strings.h>
 #include <dirent.h>
 
-#include "config.h"
+#include <libavutil/common.h>
+
 #include "common/common.h"
 #include "options/options.h"
+#include "options/m_config.h"
 #include "common/msg.h"
 #include "common/playlist.h"
+#include "misc/charset_conv.h"
 #include "misc/thread_tools.h"
 #include "options/path.h"
 #include "stream/stream.h"
@@ -33,6 +36,33 @@
 #include "demux.h"
 
 #define PROBE_SIZE (8 * 1024)
+
+enum dir_mode {
+    DIR_AUTO,
+    DIR_LAZY,
+    DIR_RECURSIVE,
+    DIR_IGNORE,
+};
+
+#define OPT_BASE_STRUCT struct demux_playlist_opts
+struct demux_playlist_opts {
+    int dir_mode;
+};
+
+struct m_sub_options demux_playlist_conf = {
+    .opts = (const struct m_option[]) {
+        {"directory-mode", OPT_CHOICE(dir_mode,
+            {"auto", DIR_AUTO},
+            {"lazy", DIR_LAZY},
+            {"recursive", DIR_RECURSIVE},
+            {"ignore", DIR_IGNORE})},
+        {0}
+    },
+    .size = sizeof(struct demux_playlist_opts),
+    .defaults = &(const struct demux_playlist_opts){
+        .dir_mode = DIR_AUTO,
+    },
+};
 
 static bool check_mimetype(struct stream *s, const char *const *list)
 {
@@ -46,23 +76,96 @@ static bool check_mimetype(struct stream *s, const char *const *list)
 }
 
 struct pl_parser {
+    struct mpv_global *global;
     struct mp_log *log;
     struct stream *s;
-    char buffer[512 * 1024];
+    char buffer[2 * 1024 * 1024];
     int utf16;
     struct playlist *pl;
     bool error;
     bool probing;
     bool force;
     bool add_base;
+    bool line_allocated;
     enum demux_check check_level;
     struct stream *real_stream;
     char *format;
+    char *codepage;
+    struct demux_playlist_opts *opts;
 };
+
+
+static uint16_t stream_read_word_endian(stream_t *s, bool big_endian)
+{
+    unsigned int y = stream_read_char(s);
+    y = (y << 8) | stream_read_char(s);
+    if (!big_endian)
+        y = ((y >> 8) & 0xFF) | (y << 8);
+    return y;
+}
+
+// Read characters until the next '\n' (including), or until the buffer in s is
+// exhausted.
+static int read_characters(stream_t *s, uint8_t *dst, int dstsize, int utf16)
+{
+    if (utf16 == 1 || utf16 == 2) {
+        uint8_t *cur = dst;
+        while (1) {
+            if ((cur - dst) + 8 >= dstsize) // PUT_UTF8 writes max. 8 bytes
+                return -1; // line too long
+            uint32_t c;
+            uint8_t tmp;
+            GET_UTF16(c, stream_read_word_endian(s, utf16 == 2), return -1;)
+            if (s->eof)
+                break; // legitimate EOF; ignore the case of partial reads
+            PUT_UTF8(c, tmp, *cur++ = tmp;)
+            if (c == '\n')
+                break;
+        }
+        return cur - dst;
+    } else {
+        uint8_t buf[1024];
+        int buf_len = stream_read_peek(s, buf, sizeof(buf));
+        uint8_t *end = memchr(buf, '\n', buf_len);
+        int len = end ? end - buf + 1 : buf_len;
+        if (len > dstsize)
+            return -1; // line too long
+        memcpy(dst, buf, len);
+        stream_seek_skip(s, stream_tell(s) + len);
+        return len;
+    }
+}
+
+// On error, or if the line is larger than max-1, return NULL and unset s->eof.
+// On EOF, return NULL, and s->eof will be set.
+// Otherwise, return the line (including \n or \r\n at the end of the line).
+// If the return value is non-NULL, it's always the same as mem.
+// utf16: 0: UTF8 or 8 bit legacy, 1: UTF16-LE, 2: UTF16-BE
+static char *read_line(stream_t *s, char *mem, int max, int utf16)
+{
+    if (max < 1)
+        return NULL;
+    int read = 0;
+    while (1) {
+        // Reserve 1 byte of ptr for terminating \0.
+        int l = read_characters(s, &mem[read], max - read - 1, utf16);
+        if (l < 0 || memchr(&mem[read], '\0', l)) {
+            MP_WARN(s, "error reading line\n");
+            return NULL;
+        }
+        read += l;
+        if (l == 0 || (read > 0 && mem[read - 1] == '\n'))
+            break;
+    }
+    mem[read] = '\0';
+    if (!stream_read_peek(s, &(char){0}, 1) && read == 0) // legitimate EOF
+        return NULL;
+    return mem;
+}
 
 static char *pl_get_line0(struct pl_parser *p)
 {
-    char *res = stream_read_line(p->s, p->buffer, sizeof(p->buffer), p->utf16);
+    char *res = read_line(p->s, p->buffer, sizeof(p->buffer), p->utf16);
     if (res) {
         int len = strlen(res);
         if (len > 0 && res[len - 1] == '\n')
@@ -75,7 +178,25 @@ static char *pl_get_line0(struct pl_parser *p)
 
 static bstr pl_get_line(struct pl_parser *p)
 {
-    return bstr0(pl_get_line0(p));
+    bstr line = bstr_strip(bstr0(pl_get_line0(p)));
+    const char *charset = mp_charset_guess(p, p->log, line, p->codepage, 0);
+    if (charset && !mp_charset_is_utf8(charset)) {
+        bstr utf8 = mp_iconv_to_utf8(p->log, line, charset, 0);
+        if (utf8.start && utf8.start != line.start) {
+            line = utf8;
+            p->line_allocated = true;
+        }
+    }
+    return line;
+}
+
+// Helper in case mp_iconv_to_utf8 allocates memory
+static void pl_free_line(struct pl_parser *p, bstr line)
+{
+    if (p->line_allocated) {
+        talloc_free(line.start);
+        p->line_allocated = false;
+    }
 }
 
 static void pl_add(struct pl_parser *p, bstr entry)
@@ -102,13 +223,15 @@ static bool maybe_text(bstr d)
 
 static int parse_m3u(struct pl_parser *p)
 {
-    bstr line = bstr_strip(pl_get_line(p));
+    bstr line = pl_get_line(p);
     if (p->probing && !bstr_equals0(line, "#EXTM3U")) {
         // Last resort: if the file extension is m3u, it might be headerless.
         if (p->check_level == DEMUX_CHECK_UNSAFE) {
             char *ext = mp_splitext(p->real_stream->url, NULL);
-            bstr data = stream_peek(p->real_stream, PROBE_SIZE);
-            if (ext && data.len > 10 && maybe_text(data)) {
+            char probe[PROBE_SIZE];
+            int len = stream_read_peek(p->real_stream, probe, sizeof(probe));
+            bstr data = {probe, len};
+            if (ext && data.len >= 2 && maybe_text(data)) {
                 const char *exts[] = {"m3u", "m3u8", NULL};
                 for (int n = 0; exts[n]; n++) {
                     if (strcasecmp(ext, exts[n]) == 0)
@@ -116,42 +239,50 @@ static int parse_m3u(struct pl_parser *p)
                 }
             }
         }
+        pl_free_line(p, line);
         return -1;
     }
 
 ok:
-    if (p->probing)
+    if (p->probing) {
+        pl_free_line(p, line);
         return 0;
+    }
 
     char *title = NULL;
     while (line.len || !pl_eof(p)) {
-        if (bstr_eatstart0(&line, "#EXTINF:")) {
+        bstr line_dup = line;
+        if (bstr_eatstart0(&line_dup, "#EXTINF:")) {
             bstr duration, btitle;
-            if (bstr_split_tok(line, ",", &duration, &btitle) && btitle.len) {
+            if (bstr_split_tok(line_dup, ",", &duration, &btitle) && btitle.len) {
                 talloc_free(title);
                 title = bstrto0(NULL, btitle);
             }
-        } else if (bstr_startswith0(line, "#EXT-X-")) {
+        } else if (bstr_startswith0(line_dup, "#EXT-X-")) {
             p->format = "hls";
-        } else if (line.len > 0 && !bstr_startswith0(line, "#")) {
-            char *fn = bstrto0(NULL, line);
+        } else if (line_dup.len > 0 && !bstr_startswith0(line_dup, "#")) {
+            char *fn = bstrto0(NULL, line_dup);
             struct playlist_entry *e = playlist_entry_new(fn);
             talloc_free(fn);
             e->title = talloc_steal(e, title);
             title = NULL;
             playlist_add(p->pl, e);
         }
-        line = bstr_strip(pl_get_line(p));
+        pl_free_line(p, line);
+        line = pl_get_line(p);
     }
+    pl_free_line(p, line);
     talloc_free(title);
     return 0;
 }
 
 static int parse_ref_init(struct pl_parser *p)
 {
-    bstr line = bstr_strip(pl_get_line(p));
-    if (!bstr_equals0(line, "[Reference]"))
+    bstr line = pl_get_line(p);
+    if (!bstr_equals0(line, "[Reference]")) {
+        pl_free_line(p, line);
         return -1;
+    }
 
     // ASF http streaming redirection - this is needed because ffmpeg http://
     // and mmsh:// can not automatically switch automatically between each
@@ -169,12 +300,14 @@ static int parse_ref_init(struct pl_parser *p)
     }
 
     while (!pl_eof(p)) {
-        line = bstr_strip(pl_get_line(p));
-        if (bstr_case_startswith(line, bstr0("Ref"))) {
-            bstr_split_tok(line, "=", &(bstr){0}, &line);
-            if (line.len)
-                pl_add(p, line);
+        line = pl_get_line(p);
+        bstr line_dup = line;
+        if (bstr_case_startswith(line_dup, bstr0("Ref"))) {
+            bstr_split_tok(line, "=", &(bstr){0}, &line_dup);
+            if (line_dup.len)
+                pl_add(p, line_dup);
         }
+        pl_free_line(p, line);
     }
     return 0;
 }
@@ -184,15 +317,20 @@ static int parse_ini_thing(struct pl_parser *p, const char *header,
 {
     bstr line = {0};
     while (!line.len && !pl_eof(p))
-        line = bstr_strip(pl_get_line(p));
-    if (bstrcasecmp0(line, header) != 0)
+        line = pl_get_line(p);
+    if (bstrcasecmp0(line, header) != 0) {
+        pl_free_line(p, line);
         return -1;
-    if (p->probing)
+    }
+    if (p->probing) {
+        pl_free_line(p, line);
         return 0;
+    }
     while (!pl_eof(p)) {
-        line = bstr_strip(pl_get_line(p));
+        line = pl_get_line(p);
+        bstr line_dup = line;
         bstr key, value;
-        if (bstr_split_tok(line, "=", &key, &value) &&
+        if (bstr_split_tok(line_dup, "=", &key, &value) &&
             bstr_case_startswith(key, bstr0(entry)))
         {
             value = bstr_strip(value);
@@ -200,6 +338,7 @@ static int parse_ini_thing(struct pl_parser *p, const char *header,
                 value = bstr_splice(value, 1, -1);
             pl_add(p, value);
         }
+        pl_free_line(p, line);
     }
     return 0;
 }
@@ -222,10 +361,11 @@ static int parse_txt(struct pl_parser *p)
         return 0;
     MP_WARN(p, "Reading plaintext playlist.\n");
     while (!pl_eof(p)) {
-        bstr line = bstr_strip(pl_get_line(p));
+        bstr line = pl_get_line(p);
         if (line.len == 0)
             continue;
         pl_add(p, line);
+        pl_free_line(p, line);
     }
     return 0;
 }
@@ -237,10 +377,27 @@ static bool same_st(struct stat *st1, struct stat *st2)
     return st1->st_dev == st2->st_dev && st1->st_ino == st2->st_ino;
 }
 
+struct pl_dir_entry {
+    char *path;
+    char *name;
+    struct stat st;
+    bool is_dir;
+};
+
+static int cmp_dir_entry(const void *a, const void *b)
+{
+    struct pl_dir_entry *a_entry = (struct pl_dir_entry*) a;
+    struct pl_dir_entry *b_entry = (struct pl_dir_entry*) b;
+    if (a_entry->is_dir == b_entry->is_dir) {
+        return mp_natural_sort_cmp(a_entry->name, b_entry->name);
+    } else {
+        return a_entry->is_dir ? 1 : -1;
+    }
+}
+
 // Return true if this was a readable directory.
 static bool scan_dir(struct pl_parser *p, char *path,
-                     struct stat *dir_stack, int num_dir_stack,
-                     char ***files, int *num_files)
+                     struct stat *dir_stack, int num_dir_stack)
 {
     if (strlen(path) >= 8192 || num_dir_stack == MAX_DIR_STACK)
         return false; // things like mount bind loops
@@ -250,6 +407,11 @@ static bool scan_dir(struct pl_parser *p, char *path,
         MP_ERR(p, "Could not read directory.\n");
         return false;
     }
+
+    struct pl_dir_entry *dir_entries = NULL;
+    int num_dir_entries = 0;
+    int path_len = strlen(path);
+    int dir_mode = p->opts->dir_mode;
 
     struct dirent *ep;
     while ((ep = readdir(dp))) {
@@ -263,29 +425,41 @@ static bool scan_dir(struct pl_parser *p, char *path,
 
         struct stat st;
         if (stat(file, &st) == 0 && S_ISDIR(st.st_mode)) {
-            for (int n = 0; n < num_dir_stack; n++) {
-                if (same_st(&dir_stack[n], &st)) {
-                    MP_VERBOSE(p, "Skip recursive entry: %s\n", file);
-                    goto skip;
+            if (dir_mode != DIR_IGNORE) {
+                for (int n = 0; n < num_dir_stack; n++) {
+                    if (same_st(&dir_stack[n], &st)) {
+                        MP_VERBOSE(p, "Skip recursive entry: %s\n", file);
+                        goto skip;
+                    }
                 }
-            }
 
-            dir_stack[num_dir_stack] = st;
-            scan_dir(p, file, dir_stack, num_dir_stack + 1, files, num_files);
+                struct pl_dir_entry d = {file, &file[path_len], st, true};
+                MP_TARRAY_APPEND(p, dir_entries, num_dir_entries, d);
+            }
         } else {
-            MP_TARRAY_APPEND(p, *files, *num_files, file);
+            struct pl_dir_entry f = {file, &file[path_len], .is_dir = false};
+            MP_TARRAY_APPEND(p, dir_entries, num_dir_entries, f);
         }
 
         skip: ;
     }
-
     closedir(dp);
-    return true;
-}
 
-static int cmp_filename(const void *a, const void *b)
-{
-    return mp_natural_sort_cmp(*(char **)a, *(char **)b);
+    if (dir_entries)
+        qsort(dir_entries, num_dir_entries, sizeof(dir_entries[0]), cmp_dir_entry);
+
+    for (int n = 0; n < num_dir_entries; n++) {
+        if (dir_mode == DIR_RECURSIVE && dir_entries[n].is_dir) {
+            dir_stack[num_dir_stack] = dir_entries[n].st;
+            char *file = dir_entries[n].path;
+            scan_dir(p, file, dir_stack, num_dir_stack + 1);
+        }
+        else {
+            playlist_add_file(p->pl, dir_entries[n].path);
+        }
+    }
+
+    return true;
 }
 
 static int parse_dir(struct pl_parser *p)
@@ -299,21 +473,19 @@ static int parse_dir(struct pl_parser *p)
     if (!path)
         return -1;
 
-    char **files = NULL;
-    int num_files = 0;
     struct stat dir_stack[MAX_DIR_STACK];
 
-    scan_dir(p, path, dir_stack, 0, &files, &num_files);
+    if (p->opts->dir_mode == DIR_AUTO) {
+        struct MPOpts *opts = mp_get_config_group(NULL, p->global, &mp_opt_root);
+        p->opts->dir_mode = opts->shuffle ? DIR_RECURSIVE : DIR_LAZY;
+        talloc_free(opts);
+    }
 
-    if (files)
-        qsort(files, num_files, sizeof(files[0]), cmp_filename);
-
-    for (int n = 0; n < num_files; n++)
-        playlist_add_file(p->pl, files[n]);
+    scan_dir(p, path, dir_stack, 0);
 
     p->add_base = false;
 
-    return num_files > 0 ? 0 : -1;
+    return p->pl->num_entries > 0 ? 0 : -1;
 }
 
 #define MIME_TYPES(...) \
@@ -361,13 +533,18 @@ static int open_file(struct demuxer *demuxer, enum demux_check check)
     bool force = check < DEMUX_CHECK_UNSAFE || check == DEMUX_CHECK_REQUEST;
 
     struct pl_parser *p = talloc_zero(NULL, struct pl_parser);
+    p->global = demuxer->global;
     p->log = demuxer->log;
     p->pl = talloc_zero(p, struct playlist);
     p->real_stream = demuxer->stream;
     p->add_base = true;
 
-    bstr probe_buf = stream_peek(demuxer->stream, PROBE_SIZE);
-    p->s = stream_memory_open(demuxer->global, probe_buf.start, probe_buf.len);
+    struct demux_opts *opts = mp_get_config_group(p, p->global, &demux_conf);
+    p->codepage = opts->meta_cp;
+
+    char probe[PROBE_SIZE];
+    int probe_len = stream_read_peek(p->real_stream, probe, sizeof(probe));
+    p->s = stream_memory_open(demuxer->global, probe, probe_len);
     p->s->mime_type = demuxer->stream->mime_type;
     p->utf16 = stream_skip_bom(p->s);
     p->force = force;
@@ -385,9 +562,11 @@ static int open_file(struct demuxer *demuxer, enum demux_check check)
     p->error = false;
     p->s = demuxer->stream;
     p->utf16 = stream_skip_bom(p->s);
+    p->opts = mp_get_config_group(demuxer, demuxer->global, &demux_playlist_conf);
     bool ok = fmt->parse(p) >= 0 && !p->error;
     if (p->add_base)
         playlist_add_base_path(p->pl, mp_dirname(demuxer->filename));
+    playlist_set_stream_flags(p->pl, demuxer->stream_origin);
     demuxer->playlist = talloc_steal(demuxer, p->pl);
     demuxer->filetype = p->format ? p->format : fmt->name;
     demuxer->fully_read = true;
@@ -397,7 +576,7 @@ static int open_file(struct demuxer *demuxer, enum demux_check check)
     return ok ? 0 : -1;
 }
 
-const struct demuxer_desc demuxer_desc_playlist = {
+const demuxer_desc_t demuxer_desc_playlist = {
     .name = "playlist",
     .desc = "Playlist file",
     .open = open_file,

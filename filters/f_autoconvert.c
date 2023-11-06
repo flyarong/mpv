@@ -1,5 +1,3 @@
-#include "config.h"
-
 #include "audio/aframe.h"
 #include "audio/chmap_sel.h"
 #include "audio/format.h"
@@ -27,6 +25,8 @@ struct priv {
     int *imgfmts;
     int *subfmts;
     int num_imgfmts;
+    struct mp_image_params imgparams;
+    bool imgparams_set;
 
     // Enable special conversion for the final stage before the VO.
     bool vo_convert;
@@ -57,22 +57,12 @@ static const struct mp_filter_info convert_filter = {
     .name = "convert",
 };
 
-// For hw decoding: thing which can convert between underlying surface formats.
-// The filter detects the needed target format from struct mp_hwdec_ctx.
-struct subfmt_conv {
-    int hw_imgfmt;
-    struct mp_filter *(*create)(struct mp_filter *parent);
-};
-
-static const struct subfmt_conv subfmt_converters[] = {
-    {0}
-};
-
 void mp_autoconvert_clear(struct mp_autoconvert *c)
 {
     struct priv *p = c->f->priv;
 
     p->num_imgfmts = 0;
+    p->imgparams_set = false;
     p->num_afmts = 0;
     p->num_srates = 0;
     p->chmaps = (struct mp_chmap_sel){0};
@@ -93,50 +83,29 @@ void mp_autoconvert_add_imgfmt(struct mp_autoconvert *c, int imgfmt, int subfmt)
     p->force_update = true;
 }
 
+void mp_autoconvert_set_target_image_params(struct mp_autoconvert *c,
+                                            struct mp_image_params *par)
+{
+    struct priv *p = c->f->priv;
+
+    if (p->imgparams_set && mp_image_params_equal(&p->imgparams, par) &&
+        p->num_imgfmts == 1 && p->imgfmts[0] == par->imgfmt &&
+        p->subfmts[0] == par->hw_subfmt)
+        return;
+
+    p->imgparams = *par;
+    p->imgparams_set = true;
+
+    p->num_imgfmts = 0;
+    mp_autoconvert_add_imgfmt(c, par->imgfmt, par->hw_subfmt);
+}
+
 void mp_autoconvert_add_all_sw_imgfmts(struct mp_autoconvert *c)
 {
     for (int n = IMGFMT_START; n < IMGFMT_END; n++) {
         if (!IMGFMT_IS_HWACCEL(n))
             mp_autoconvert_add_imgfmt(c, n, 0);
     }
-}
-
-void mp_autoconvert_add_vo_hwdec_subfmts(struct mp_autoconvert *c,
-                                         struct mp_hwdec_devices *devs)
-{
-    struct priv *p = c->f->priv;
-    assert(devs);
-
-    int prev_format = 0;
-
-    for (int n = 0; ; n++) {
-        struct mp_hwdec_ctx *ctx = hwdec_devices_get_n(devs, n);
-        if (!ctx)
-            break;
-        if (!ctx->hw_imgfmt || !ctx->supported_formats)
-            continue;
-        // Very hacky: don't let d3d11-egl-rgb overwrite d3d11-egl
-        if (ctx->hw_imgfmt == prev_format)
-            continue;
-        prev_format = ctx->hw_imgfmt;
-        // Stupidity: VOs export imgfmt only, so subfmt is always 0. Remove it
-        // to fix it up.
-        for (int i = 0; i < p->num_imgfmts; i++) {
-            if (p->imgfmts[i] != ctx->hw_imgfmt)
-                continue;
-
-            int count = p->num_imgfmts;
-            MP_TARRAY_REMOVE_AT(p->imgfmts, count, i);
-            count = p->num_imgfmts;
-            MP_TARRAY_REMOVE_AT(p->subfmts, count, i);
-            p->num_imgfmts -= 1;
-            break;
-        }
-        for (int i = 0; ctx->supported_formats[i]; i++)
-            mp_autoconvert_add_imgfmt(c, ctx->hw_imgfmt, ctx->supported_formats[i]);
-    }
-
-    p->vo_convert = true;
 }
 
 void mp_autoconvert_add_afmt(struct mp_autoconvert *c, int afmt)
@@ -178,18 +147,22 @@ static bool build_image_converter(struct mp_autoconvert *c, struct mp_log *log,
     if (!p->num_imgfmts)
         return true;
 
-    bool different_subfmt = false;
-
     for (int n = 0; n < p->num_imgfmts; n++) {
         bool samefmt = img->params.imgfmt == p->imgfmts[n];
         bool samesubffmt = img->params.hw_subfmt == p->subfmts[n];
-        if (samefmt && !samesubffmt)
-            different_subfmt = true;
-        if (samefmt && (samesubffmt || !p->subfmts[n]))
+        /*
+         * In practice, `p->subfmts` is not usually populated today, in which
+         * case we must actively probe formats below to establish if the VO can
+         * accept the subfmt being used by the hwdec.
+         */
+        if (samefmt && samesubffmt) {
+            if (p->imgparams_set) {
+                if (!mp_image_params_equal(&p->imgparams, &img->params))
+                    break;
+            }
             return true;
+        }
     }
-
-    struct mp_stream_info *info = mp_filter_find_stream_info(f);
 
     struct mp_filter *conv = mp_filter_create(f, &convert_filter);
     mp_filter_add_pin(conv, MP_PIN_IN, "in");
@@ -200,9 +173,12 @@ static bool build_image_converter(struct mp_autoconvert *c, struct mp_log *log,
     // 2: sw->hw upload
     struct mp_filter *filters[3] = {0};
     bool need_sws = true;
+    bool force_sws_params = false;
+    struct mp_image_params imgpar = img->params;
 
     int *fmts = p->imgfmts;
     int num_fmts = p->num_imgfmts;
+    int hwupload_fmt = 0;
 
     bool imgfmt_is_sw = !IMGFMT_IS_HWACCEL(img->imgfmt);
 
@@ -212,38 +188,77 @@ static bool build_image_converter(struct mp_autoconvert *c, struct mp_log *log,
 
     bool dst_all_hw = true;
     bool dst_have_sw = false;
+    bool has_src_hw_fmt = false;
     for (int n = 0; n < num_fmts; n++) {
         bool is_hw = IMGFMT_IS_HWACCEL(fmts[n]);
         dst_all_hw &= is_hw;
         dst_have_sw |= !is_hw;
+        has_src_hw_fmt |= is_hw && fmts[n] == imgpar.imgfmt;
     }
 
-    // Source is sw, all targets are hw -> try to upload.
-    bool sw_to_hw = imgfmt_is_sw && dst_all_hw;
     // Source is hw, some targets are sw -> try to download.
     bool hw_to_sw = !imgfmt_is_sw && dst_have_sw;
 
-    if (sw_to_hw && num_fmts > 0) {
-        // We can probably use this! Very lazy and very approximate.
-        struct mp_hwupload *upload = mp_hwupload_create(conv, fmts[0]);
-        if (upload) {
-            mp_info(log, "HW-uploading to %s\n", mp_imgfmt_to_name(fmts[0]));
-            filters[2] = upload->f;
-            fmts = upload->upload_fmts;
-            num_fmts = upload->num_upload_fmts;
-            hw_to_sw = false;
-        }
-    } else if (p->vo_convert && different_subfmt && info && info->hwdec_devs) {
-        for (int n = 0; subfmt_converters[n].hw_imgfmt; n++) {
-            if (subfmt_converters[n].hw_imgfmt == img->imgfmt) {
-                mp_info(log, "Using HW sub-conversion.\n");
-                filters[2] = subfmt_converters[n].create(conv);
-                if (filters[2]) {
-                    need_sws = false;
-                    hw_to_sw = false;
-                    break;
-                }
+    if (has_src_hw_fmt) {
+        int src_fmt = img->params.hw_subfmt;
+        /*
+         * If the source format is a hardware format, and our output supports
+         * that hardware format, we prioritize preserving the use of that
+         * hardware format. In most cases, the sub format will also be supported
+         * and no conversion will be required, but in some cases, the hwdec
+         * may be able to output formats that the VO cannot display, and
+         * hardware format conversion becomes necessary.
+         */
+        struct mp_hwupload upload = mp_hwupload_create(conv, imgpar.imgfmt,
+                                                       src_fmt,
+                                                       true);
+        if (upload.successful_init) {
+            if (upload.f) {
+                mp_info(log, "Converting %s[%s] -> %s[%s]\n",
+                        mp_imgfmt_to_name(imgpar.imgfmt),
+                        mp_imgfmt_to_name(src_fmt),
+                        mp_imgfmt_to_name(imgpar.imgfmt),
+                        mp_imgfmt_to_name(upload.selected_sw_imgfmt));
+                filters[2] = upload.f;
             }
+            hw_to_sw = false;
+            need_sws = false;
+        } else {
+            mp_err(log, "Failed to create HW uploader for format %s\n",
+                   mp_imgfmt_to_name(src_fmt));
+        }
+    } else if (dst_all_hw && num_fmts > 0) {
+        bool upload_created = false;
+        int sw_fmt = imgfmt_is_sw ? img->imgfmt : img->params.hw_subfmt;
+
+        for (int i = 0; i < num_fmts; i++) {
+            // We can probably use this! Very lazy and very approximate.
+            struct mp_hwupload upload = mp_hwupload_create(conv, fmts[i],
+                                                           sw_fmt, false);
+            if (upload.successful_init) {
+                mp_info(log, "HW-uploading to %s\n", mp_imgfmt_to_name(fmts[i]));
+                filters[2] = upload.f;
+                hwupload_fmt = upload.selected_sw_imgfmt;
+                fmts = &hwupload_fmt;
+                num_fmts = hwupload_fmt ? 1 : 0;
+                hw_to_sw = false;
+
+                // We cannot do format conversions when transferring between
+                // two hardware devices, so reject this format if that would be
+                // required.
+                if (!imgfmt_is_sw && hwupload_fmt != sw_fmt) {
+                    mp_err(log, "Format %s is not supported by %s\n",
+                           mp_imgfmt_to_name(sw_fmt),
+                           mp_imgfmt_to_name(p->imgfmts[i]));
+                    continue;
+                }
+                upload_created = true;
+                break;
+            }
+        }
+        if (!upload_created) {
+            mp_err(log, "Failed to create HW uploader for format %s\n",
+                   mp_imgfmt_to_name(sw_fmt));
         }
     }
 
@@ -259,7 +274,24 @@ static bool build_image_converter(struct mp_autoconvert *c, struct mp_log *log,
         if (hwd) {
             filters[0] = hwd->f;
             src_fmt = res_fmt;
+            // Downloading from hw will obviously change the parameters. We
+            // stupidly don't know the result parameters, but if it's
+            // sufficiently sane, it will only do the following.
+            imgpar.imgfmt = src_fmt;
+            imgpar.hw_subfmt = 0;
+            // Try to compensate for in-sane cases.
+            mp_image_params_guess_csp(&imgpar);
         }
+    }
+
+    if (p->imgparams_set) {
+        force_sws_params |= !mp_image_params_equal(&imgpar, &p->imgparams);
+        need_sws |= force_sws_params;
+    }
+    if (!imgfmt_is_sw && dst_all_hw) {
+        // This is a hw -> hw upload, so the sw format must already be
+        // mutually understood. No conversion can be done.
+        need_sws = false;
     }
 
     if (need_sws) {
@@ -270,18 +302,22 @@ static bool build_image_converter(struct mp_autoconvert *c, struct mp_log *log,
             goto fail;
         }
 
-        int out = mp_sws_find_best_out_format(src_fmt,  fmts, num_fmts);
+        sws->force_scaler = c->force_scaler;
+
+        int out = mp_sws_find_best_out_format(sws, src_fmt, fmts, num_fmts);
         if (!out) {
             mp_err(log, "can't find video conversion for %s\n",
                    mp_imgfmt_to_name(src_fmt));
             goto fail;
         }
 
-        if (out == src_fmt) {
+        if (out == src_fmt && !force_sws_params) {
             // Can happen if hwupload goes to same format.
             talloc_free(sws->f);
         } else {
             sws->out_format = out;
+            sws->out_params = p->imgparams;
+            sws->use_out_params = force_sws_params;
             mp_info(log, "Converting %s -> %s\n", mp_imgfmt_to_name(src_fmt),
                     mp_imgfmt_to_name(sws->out_format));
             filters[1] = sws->f;
@@ -322,8 +358,8 @@ static void handle_video_frame(struct mp_filter *f)
     }
 
     if (!mp_subfilter_drain_destroy(&p->sub)) {
-        p->in_imgfmt = p->in_subfmt = 0;
-        return;
+        MP_VERBOSE(f, "Sub-filter requires draining but we must destroy it now.\n");
+        mp_subfilter_destroy(&p->sub);
     }
 
     p->in_imgfmt = img->params.imgfmt;

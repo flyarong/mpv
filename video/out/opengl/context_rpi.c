@@ -15,8 +15,9 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stddef.h>
 #include <assert.h>
+#include <stdatomic.h>
+#include <stddef.h>
 
 #include <bcm_host.h>
 
@@ -24,7 +25,6 @@
 #include <EGL/eglext.h>
 
 #include "common/common.h"
-#include "osdep/atomic.h"
 #include "video/out/win_state.h"
 #include "context.h"
 #include "egl_helpers.h"
@@ -302,9 +302,6 @@ static int rpi_control(struct ra_ctx *ctx, int *events, int request, void *arg)
     switch (request) {
     case VOCTRL_SCREENSHOT_WIN:
         *(struct mp_image **)arg = take_screenshot(ctx);
-        return VO_TRUE;
-    case VOCTRL_FULLSCREEN:
-        recreate_dispmanx(ctx);
         return VO_TRUE;
     case VOCTRL_CHECK_EVENTS:
         if (atomic_fetch_and(&p->reload_display, 0)) {

@@ -20,7 +20,6 @@
 #include <errno.h>
 #include <assert.h>
 
-#include "config.h"
 #include "mpv_talloc.h"
 
 #include "osdep/io.h"
@@ -44,6 +43,12 @@
 
 #include "core.h"
 #include "command.h"
+
+const int num_ptracks[STREAM_TYPE_COUNT] = {
+    [STREAM_VIDEO] = 1,
+    [STREAM_AUDIO] = 1,
+    [STREAM_SUB] = 2,
+};
 
 double rel_time_to_abs(struct MPContext *mpctx, struct m_rel_time t)
 {
@@ -123,6 +128,9 @@ bool get_ab_loop_times(struct MPContext *mpctx, double t[2])
     t[0] = opts->ab_loop[0];
     t[1] = opts->ab_loop[1];
 
+    if (!opts->ab_loop_count)
+        return false;
+
     if (t[0] == MP_NOPTS_VALUE || t[1] == MP_NOPTS_VALUE || t[0] == t[1])
         return false;
 
@@ -158,6 +166,20 @@ void issue_refresh_seek(struct MPContext *mpctx, enum seek_precision min_prec)
         return;
     }
     queue_seek(mpctx, MPSEEK_ABSOLUTE, get_current_time(mpctx), min_prec, 0);
+}
+
+void update_content_type(struct MPContext *mpctx, struct track *track)
+{
+    enum mp_content_type content_type;
+    if (!track || !track->vo_c) {
+        content_type = MP_CONTENT_NONE;
+    } else if (track->image) {
+        content_type = MP_CONTENT_IMAGE;
+    } else {
+        content_type = MP_CONTENT_VIDEO;
+    }
+    if (mpctx->video_out)
+        vo_control(mpctx->video_out, VOCTRL_CONTENT_TYPE, &content_type);
 }
 
 void update_vo_playback_state(struct MPContext *mpctx)
@@ -238,7 +260,9 @@ void error_on_track(struct MPContext *mpctx, struct track *track)
 int stream_dump(struct MPContext *mpctx, const char *source_filename)
 {
     struct MPOpts *opts = mpctx->opts;
-    stream_t *stream = stream_open(source_filename, mpctx->global);
+    stream_t *stream = stream_create(source_filename,
+                                     STREAM_ORIGIN_DIRECT | STREAM_READ,
+                                     mpctx->playback_abort, mpctx->global);
     if (!stream)
         return -1;
 
@@ -258,13 +282,13 @@ int stream_dump(struct MPContext *mpctx, const char *source_filename)
             MP_MSG(mpctx, MSGL_STATUS, "Dumping %lld/%lld...",
                    (long long int)pos, (long long int)size);
         }
-        bstr data = stream_peek(stream, 4096);
-        if (data.len == 0) {
+        uint8_t buf[4096];
+        int len = stream_read(stream, buf, sizeof(buf));
+        if (!len) {
             ok &= stream->eof;
             break;
         }
-        ok &= fwrite(data.start, data.len, 1, dest) == 1;
-        stream_skip(stream, data.len);
+        ok &= fwrite(buf, len, 1, dest) == 1;
         mp_wakeup_core(mpctx); // don't actually sleep
         mp_idle(mpctx); // but process input
     }
@@ -276,11 +300,12 @@ int stream_dump(struct MPContext *mpctx, const char *source_filename)
 
 void merge_playlist_files(struct playlist *pl)
 {
-    if (!pl->first)
+    if (!pl->num_entries)
         return;
     char *edl = talloc_strdup(NULL, "edl://");
-    for (struct playlist_entry *e = pl->first; e; e = e->next) {
-        if (e != pl->first)
+    for (int n = 0; n < pl->num_entries; n++) {
+        struct playlist_entry *e = pl->entries[n];
+        if (n)
             edl = talloc_strdup_append_buffer(edl, ";");
         // Escape if needed
         if (e->filename[strcspn(e->filename, "=%,;\n")] ||
@@ -294,4 +319,16 @@ void merge_playlist_files(struct playlist *pl)
     playlist_clear(pl);
     playlist_add_file(pl, edl);
     talloc_free(edl);
+}
+
+const char *mp_status_str(enum playback_status st)
+{
+    switch (st) {
+    case STATUS_SYNCING:    return "syncing";
+    case STATUS_READY:      return "ready";
+    case STATUS_PLAYING:    return "playing";
+    case STATUS_DRAINING:   return "draining";
+    case STATUS_EOF:        return "eof";
+    default:                return "bug";
+    }
 }

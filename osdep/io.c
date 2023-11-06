@@ -32,6 +32,7 @@
 #include "mpv_talloc.h"
 
 #include "config.h"
+#include "misc/random.h"
 #include "osdep/io.h"
 #include "osdep/terminal.h"
 
@@ -145,7 +146,7 @@ char *mp_to_utf8(void *talloc_ctx, const wchar_t *s)
 
 #include <io.h>
 #include <fcntl.h>
-#include <pthread.h>
+#include "osdep/threads.h"
 
 static void set_errno_from_lasterror(void)
 {
@@ -669,8 +670,8 @@ static void init_getenv(void)
 
 char *mp_getenv(const char *name)
 {
-    static pthread_once_t once_init_getenv = PTHREAD_ONCE_INIT;
-    pthread_once(&once_init_getenv, init_getenv);
+    static mp_once once_init_getenv = MP_STATIC_ONCE_INITIALIZER;
+    mp_exec_once(&once_init_getenv, init_getenv);
     // Copied from musl, http://git.musl-libc.org/cgit/musl/tree/COPYRIGHT
     // Copyright © 2005-2013 Rich Felker, standard MIT license
     int i;
@@ -682,6 +683,12 @@ char *mp_getenv(const char *name)
     return NULL;
 }
 
+char ***mp_penviron(void)
+{
+    mp_getenv("");  // ensure init
+    return &utf8_environ;  // `environ' should be an l-value
+}
+
 off_t mp_lseek(int fd, off_t offset, int whence)
 {
     HANDLE h = (HANDLE)_get_osfhandle(fd);
@@ -690,6 +697,76 @@ off_t mp_lseek(int fd, off_t offset, int whence)
         return (off_t)-1;
     }
     return _lseeki64(fd, offset, whence);
+}
+
+_Thread_local
+static struct {
+    DWORD errcode;
+    char *errstring;
+} mp_dl_result = {
+    .errcode = 0,
+    .errstring = NULL
+};
+
+static void mp_dl_free(void)
+{
+    if (mp_dl_result.errstring != NULL) {
+        talloc_free(mp_dl_result.errstring);
+    }
+}
+
+static void mp_dl_init(void)
+{
+    atexit(mp_dl_free);
+}
+
+void *mp_dlopen(const char *filename, int flag)
+{
+    wchar_t *wfilename = mp_from_utf8(NULL, filename);
+    HMODULE lib = LoadLibraryW(wfilename);
+    talloc_free(wfilename);
+    mp_dl_result.errcode = GetLastError();
+    return (void *)lib;
+}
+
+void *mp_dlsym(void *handle, const char *symbol)
+{
+    FARPROC addr = GetProcAddress((HMODULE)handle, symbol);
+    mp_dl_result.errcode = GetLastError();
+    return (void *)addr;
+}
+
+char *mp_dlerror(void)
+{
+    static mp_once once_init_dlerror = MP_STATIC_ONCE_INITIALIZER;
+    mp_exec_once(&once_init_dlerror, mp_dl_init);
+    mp_dl_free();
+
+    if (mp_dl_result.errcode == 0)
+        return NULL;
+
+    // convert error code to a string message
+    LPWSTR werrstring = NULL;
+    FormatMessageW(
+        FORMAT_MESSAGE_FROM_SYSTEM
+            | FORMAT_MESSAGE_IGNORE_INSERTS
+            | FORMAT_MESSAGE_ALLOCATE_BUFFER,
+        NULL,
+        mp_dl_result.errcode,
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_NEUTRAL),
+        (LPWSTR) &werrstring,
+        0,
+        NULL);
+    mp_dl_result.errcode = 0;
+
+    if (werrstring) {
+        mp_dl_result.errstring = mp_to_utf8(NULL, werrstring);
+        LocalFree(werrstring);
+    }
+
+    return mp_dl_result.errstring == NULL
+        ? "unknown error"
+        : mp_dl_result.errstring;
 }
 
 #if HAVE_UWP
@@ -798,7 +875,7 @@ int mp_mkostemps(char *template, int suffixlen, int flags)
     for (size_t fuckshit = 0; fuckshit < UINT32_MAX; fuckshit++) {
         // Using a random value may make it require fewer iterations (even if
         // not truly random; just a counter would be sufficient).
-        size_t fuckmess = rand();
+        size_t fuckmess = mp_rand_next();
         char crap[7] = "";
         snprintf(crap, sizeof(crap), "%06zx", fuckmess);
         memcpy(t, crap, 6);

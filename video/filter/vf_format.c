@@ -22,6 +22,7 @@
 #include <math.h>
 
 #include <libavutil/rational.h>
+#include <libavutil/buffer.h>
 
 #include "common/msg.h"
 #include "common/common.h"
@@ -36,12 +37,11 @@
 
 struct priv {
     struct vf_format_opts *opts;
-    struct mp_pin *in_pin;
+    struct mp_autoconvert *conv;
 };
 
 struct vf_format_opts {
     int fmt;
-    int outfmt;
     int colormatrix;
     int colorlevels;
     int primaries;
@@ -51,36 +51,19 @@ struct vf_format_opts {
     int chroma_location;
     int stereo_in;
     int rotate;
+    int alpha;
+    int w, h;
     int dw, dh;
     double dar;
+    bool convert;
+    int force_scaler;
+    bool dovi;
+    bool film_grain;
 };
 
-static void vf_format_process(struct mp_filter *f)
+static void set_params(struct vf_format_opts *p, struct mp_image_params *out,
+                       bool set_size)
 {
-    struct priv *priv = f->priv;
-    struct vf_format_opts *p = priv->opts;
-
-    if (!mp_pin_can_transfer_data(f->ppins[1], priv->in_pin))
-        return;
-
-    struct mp_frame frame = mp_pin_out_read(priv->in_pin);
-
-    if (mp_frame_is_signaling(frame)) {
-        mp_pin_in_write(f->ppins[1], frame);
-        return;
-    }
-    if (frame.type != MP_FRAME_VIDEO) {
-        MP_ERR(f, "unsupported frame type\n");
-        mp_frame_unref(&frame);
-        mp_filter_internal_mark_failed(f);
-        return;
-    }
-
-    struct mp_image *img = frame.data;
-    struct mp_image_params *out = &img->params;
-
-    if (p->outfmt)
-        out->imgfmt = p->outfmt;
     if (p->colormatrix)
         out->color.space = p->colormatrix;
     if (p->colorlevels)
@@ -94,12 +77,12 @@ static void vf_format_process(struct mp_filter *f)
             // When changing the gamma function explicitly, also reset stuff
             // related to the gamma function since that information will almost
             // surely be false now and have to be re-inferred
-            out->color.sig_peak = 0.0;
+            out->color.hdr = (struct pl_hdr_metadata){0};
             out->color.light = MP_CSP_LIGHT_AUTO;
         }
     }
     if (p->sig_peak)
-        out->color.sig_peak = p->sig_peak;
+        out->color.hdr = (struct pl_hdr_metadata){ .max_luma = p->sig_peak * MP_REF_WHITE };
     if (p->light)
         out->color.light = p->light;
     if (p->chroma_location)
@@ -108,7 +91,13 @@ static void vf_format_process(struct mp_filter *f)
         out->stereo3d = p->stereo_in;
     if (p->rotate >= 0)
         out->rotate = p->rotate;
+    if (p->alpha)
+        out->alpha = p->alpha;
 
+    if (p->w > 0 && set_size)
+        out->w = p->w;
+    if (p->h > 0 && set_size)
+        out->h = p->h;
     AVRational dsize;
     mp_image_params_get_dsize(out, &dsize.num, &dsize.den);
     if (p->dw > 0)
@@ -118,11 +107,64 @@ static void vf_format_process(struct mp_filter *f)
     if (p->dar > 0)
         dsize = av_d2q(p->dar, INT_MAX);
     mp_image_params_set_dsize(out, dsize.num, dsize.den);
+}
 
-    // Make sure the user-overrides are consistent (no RGB csp for YUV, etc.).
-    mp_image_params_guess_csp(out);
+static void vf_format_process(struct mp_filter *f)
+{
+    struct priv *priv = f->priv;
 
-    mp_pin_in_write(f->ppins[1], frame);
+    if (mp_pin_can_transfer_data(priv->conv->f->pins[0], f->ppins[0])) {
+        struct mp_frame frame = mp_pin_out_read(f->ppins[0]);
+
+        if (priv->opts->convert && frame.type == MP_FRAME_VIDEO) {
+            struct mp_image *img = frame.data;
+            struct mp_image_params par = img->params;
+            int outfmt = priv->opts->fmt;
+
+            // If we convert from RGB to YUV, default to limited range.
+            if (mp_imgfmt_get_forced_csp(img->imgfmt) == MP_CSP_RGB &&
+                outfmt && mp_imgfmt_get_forced_csp(outfmt) == MP_CSP_AUTO)
+            {
+                par.color.levels = MP_CSP_LEVELS_TV;
+            }
+
+            set_params(priv->opts, &par, true);
+
+            if (outfmt && par.imgfmt != outfmt) {
+                par.imgfmt = outfmt;
+                par.hw_subfmt = 0;
+            }
+            mp_image_params_guess_csp(&par);
+
+            mp_autoconvert_set_target_image_params(priv->conv, &par);
+        }
+
+        mp_pin_in_write(priv->conv->f->pins[0], frame);
+    }
+
+    if (mp_pin_can_transfer_data(f->ppins[1], priv->conv->f->pins[1])) {
+        struct mp_frame frame = mp_pin_out_read(priv->conv->f->pins[1]);
+        struct mp_image *img = frame.data;
+
+        if (frame.type != MP_FRAME_VIDEO)
+            goto write_out;
+
+        if (!priv->opts->convert) {
+            set_params(priv->opts, &img->params, false);
+            mp_image_params_guess_csp(&img->params);
+        }
+
+        if (!priv->opts->dovi) {
+            av_buffer_unref(&img->dovi);
+            av_buffer_unref(&img->dovi_buf);
+        }
+
+        if (!priv->opts->film_grain)
+            av_buffer_unref(&img->film_grain);
+
+write_out:
+        mp_pin_in_write(f->ppins[1], frame);
+    }
 }
 
 static const struct mp_filter_info vf_format_filter = {
@@ -145,38 +187,45 @@ static struct mp_filter *vf_format_create(struct mp_filter *parent, void *option
     mp_filter_add_pin(f, MP_PIN_IN, "in");
     mp_filter_add_pin(f, MP_PIN_OUT, "out");
 
-    struct mp_autoconvert *conv = mp_autoconvert_create(f);
-    if (!conv) {
+    priv->conv = mp_autoconvert_create(f);
+    if (!priv->conv) {
         talloc_free(f);
         return NULL;
     }
 
-    if (priv->opts->fmt)
-        mp_autoconvert_add_imgfmt(conv, priv->opts->fmt, 0);
+    priv->conv->force_scaler = priv->opts->force_scaler;
 
-    priv->in_pin = conv->f->pins[1];
-    mp_pin_connect(conv->f->pins[0], f->ppins[0]);
+    if (priv->opts->fmt)
+        mp_autoconvert_add_imgfmt(priv->conv, priv->opts->fmt, 0);
 
     return f;
 }
 
 #define OPT_BASE_STRUCT struct vf_format_opts
 static const m_option_t vf_opts_fields[] = {
-    OPT_IMAGEFORMAT("fmt", fmt, 0),
-    OPT_CHOICE_C("colormatrix", colormatrix, 0, mp_csp_names),
-    OPT_CHOICE_C("colorlevels", colorlevels, 0, mp_csp_levels_names),
-    OPT_CHOICE_C("primaries", primaries, 0, mp_csp_prim_names),
-    OPT_CHOICE_C("gamma", gamma, 0, mp_csp_trc_names),
-    OPT_FLOAT("sig-peak", sig_peak, 0),
-    OPT_CHOICE_C("light", light, 0, mp_csp_light_names),
-    OPT_CHOICE_C("chroma-location", chroma_location, 0, mp_chroma_names),
-    OPT_CHOICE_C("stereo-in", stereo_in, 0, mp_stereo3d_names),
-    OPT_INTRANGE("rotate", rotate, 0, -1, 359),
-    OPT_INT("dw", dw, 0),
-    OPT_INT("dh", dh, 0),
-    OPT_DOUBLE("dar", dar, 0),
-    OPT_REMOVED("outputlevels", "use the --video-output-levels global option"),
-    OPT_REMOVED("peak", "use sig-peak instead (changed value scale!)"),
+    {"fmt", OPT_IMAGEFORMAT(fmt)},
+    {"colormatrix", OPT_CHOICE_C(colormatrix, mp_csp_names)},
+    {"colorlevels", OPT_CHOICE_C(colorlevels, mp_csp_levels_names)},
+    {"primaries", OPT_CHOICE_C(primaries, mp_csp_prim_names)},
+    {"gamma", OPT_CHOICE_C(gamma, mp_csp_trc_names)},
+    {"sig-peak", OPT_FLOAT(sig_peak)},
+    {"light", OPT_CHOICE_C(light, mp_csp_light_names)},
+    {"chroma-location", OPT_CHOICE_C(chroma_location, mp_chroma_names)},
+    {"stereo-in", OPT_CHOICE_C(stereo_in, mp_stereo3d_names)},
+    {"rotate", OPT_INT(rotate), M_RANGE(-1, 359)},
+    {"alpha", OPT_CHOICE_C(alpha, mp_alpha_names)},
+    {"w", OPT_INT(w)},
+    {"h", OPT_INT(h)},
+    {"dw", OPT_INT(dw)},
+    {"dh", OPT_INT(dh)},
+    {"dar", OPT_DOUBLE(dar)},
+    {"convert", OPT_BOOL(convert)},
+    {"dolbyvision", OPT_BOOL(dovi)},
+    {"film-grain", OPT_BOOL(film_grain)},
+    {"force-scaler", OPT_CHOICE(force_scaler,
+                                {"auto", MP_SWS_AUTO},
+                                {"sws", MP_SWS_SWS},
+                                {"zimg", MP_SWS_ZIMG})},
     {0}
 };
 
@@ -187,6 +236,8 @@ const struct mp_user_filter_entry vf_format = {
         .priv_size = sizeof(OPT_BASE_STRUCT),
         .priv_defaults = &(const OPT_BASE_STRUCT){
             .rotate = -1,
+            .dovi = true,
+            .film_grain = true,
         },
         .options = vf_opts_fields,
     },

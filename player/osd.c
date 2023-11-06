@@ -22,7 +22,6 @@
 #include <limits.h>
 #include <assert.h>
 
-#include "config.h"
 #include "mpv_talloc.h"
 
 #include "common/msg.h"
@@ -94,6 +93,21 @@ static void term_osd_update(struct MPContext *mpctx)
         mpctx->term_osd_contents = s;
         mp_msg(mpctx->statusline, MSGL_STATUS, "%s", s);
     }
+}
+
+static void term_osd_update_title(struct MPContext *mpctx)
+{
+    if (!mpctx->opts->use_terminal)
+        return;
+
+    char *s = mp_property_expand_escaped_string(mpctx, mpctx->opts->term_title);
+    if (bstr_equals(bstr0(s), bstr0(mpctx->term_osd_title))) {
+        talloc_free(s);
+        return;
+    }
+
+    mp_msg_set_term_title(mpctx->statusline, s);
+    mpctx->term_osd_title = talloc_steal(mpctx, s);
 }
 
 void term_osd_set_subs(struct MPContext *mpctx, const char *text)
@@ -181,9 +195,10 @@ static char *get_term_status_msg(struct MPContext *mpctx)
     saddf(&line, ": ");
 
     // Playback position
+    double speed = opts->term_remaining_playtime ? mpctx->video_speed : 1;
     sadd_hhmmssff(&line, get_playback_time(mpctx), opts->osd_fractions);
     saddf(&line, " / ");
-    sadd_hhmmssff(&line, get_time_length(mpctx), opts->osd_fractions);
+    sadd_hhmmssff(&line, get_time_length(mpctx) / speed, opts->osd_fractions);
 
     sadd_percentage(&line, get_percent_pos(mpctx));
 
@@ -192,7 +207,7 @@ static char *get_term_status_msg(struct MPContext *mpctx)
         saddf(&line, " x%4.2f", opts->playback_speed);
 
     // A-V sync
-    if (mpctx->ao_chain && mpctx->vo_chain && !mpctx->vo_chain->is_coverart) {
+    if (mpctx->ao_chain && mpctx->vo_chain && !mpctx->vo_chain->is_sparse) {
         saddf(&line, " A-V:%7.3f", mpctx->last_av_difference);
         if (fabs(mpctx->total_avsync_change) > 0.05)
             saddf(&line, " ct:%7.3f", mpctx->total_avsync_change);
@@ -220,7 +235,8 @@ static char *get_term_status_msg(struct MPContext *mpctx)
             int64_t c = vo_get_drop_count(mpctx->video_out);
             struct mp_decoder_wrapper *dec = mpctx->vo_chain->track
                                         ? mpctx->vo_chain->track->dec : NULL;
-            int dropped_frames = dec ? dec->dropped_frames : 0;
+            int dropped_frames =
+                dec ? mp_decoder_wrapper_get_frames_dropped(dec) : 0;
             if (c > 0 || dropped_frames > 0) {
                 saddf(&line, " Dropped: %"PRId64, c);
                 if (dropped_frames)
@@ -259,6 +275,7 @@ static void term_osd_print_status_lazy(struct MPContext *mpctx)
 {
     struct MPOpts *opts = mpctx->opts;
 
+    term_osd_update_title(mpctx);
     update_window_title(mpctx, false);
     update_vo_playback_state(mpctx);
 
@@ -443,7 +460,7 @@ static void sadd_osd_status(char **buffer, struct MPContext *mpctx, int level)
     }
 }
 
-// OSD messages initated by seeking commands are added lazily with this
+// OSD messages initiated by seeking commands are added lazily with this
 // function, because multiple successive seek commands can be coalesced.
 static void add_seek_osd_messages(struct MPContext *mpctx)
 {

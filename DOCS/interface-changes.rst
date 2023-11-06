@@ -17,13 +17,336 @@ a large part of the user interface and APIs.
 
 Also see compatibility.rst.
 
-This document lists changes to them. New changes are added to the top.
+This document lists changes to them. New changes are added to the top. Usually,
+only incompatible or important changes are mentioned. New options/commands/etc.
+are not always listed.
 
 Interface changes
 =================
 
 ::
 
+ --- mpv 0.37.0 ---
+    - `--save-position-on-quit` and its associated commands now store state files
+      in %LOCALAPPDATA% instead of %APPDATA% directory by default on Windows.
+    - change `--subs-with-matching-audio` default from `no` to `yes`
+    - change `--subs-fallback` default from `no` to `default`
+    - add the `--hdr-peak-percentile` option
+    - include `--hdr-peak-percentile` in the `gpu-hq` profile
+    - change `--audiotrack-pcm-float` default from `no` to `yes`
+    - add video-params/aspect-name
+    - change type of `--sub-pos` to float
+    - The remaining time printed in the terminal is now adjusted for speed by default.
+      You can disable this with `--no-term-remaining-playtime`.
+    - add `playlist-path` and `playlist/N/playlist-path` properties
+    - add `--x11-wid-title` option
+    - add `--libplacebo-opts` option
+    - add `--audio-file-exts`, `--cover-art-auto-exts`, and `--sub-auto-exts`
+    - change `slang` default back to NULL
+    - remove special handling of the `auto` value from `--alang/slang/vlang` options
+    - add `--subs-match-os-language` as a replacement for `--slang=auto`
+    - add `always` option to `--subs-fallback-forced`
+    - remove `auto` choice from `--sub-forced-only`
+    - remove `auto-forced-only` property
+    - rename `--sub-forced-only` to `--sub-forced-events-only`
+    - remove `sub-forced-only-cur` property (`--sub-forced-events-only` is a replacement)
+    - add `hdr-metadata` property
+    - remove deprecated `video-aspect` property
+    - add `--video-crop`
+    - add `video-params/crop-[w,h,x,y]`
+    - remove `--tone-mapping-mode`
+    - change `--subs-fallback-forced` so that it works alongside `--slang`
+    - add `--icc-3dlut-size=auto` and make it the default
+    - add `--scale=ewa_lanczos4sharpest`
+    - remove `--scale-wblur`, `--cscale-wblur`, `--dscale-wblur`, `--tscale-wblur`
+    - remove `bcspline` filter (`bicubic` is now the same as `bcspline`)
+    - rename `--cache-dir` and `--cache-unlink-files` to `--demuxer-cache-dir` and
+      `--demuxer-cache-unlink-files`
+    - enable `--correct-downscaling`, `--linear-downscaling`, `--sigmoid-upscaling`
+    - `--cscale` defaults to `--scale` if not defined
+    - change `--tscale` default to `oversample`
+    - change `--dither-depth` to `auto`
+    - deprecate `--profile=gpu-hq`, add `--profile=<fast|high-quality>`
+    - change `--dscale` default to `hermite`
+    - update defaults to `--hdr-peak-decay-rate=20`, `--hdr-scene-threshold-low=1.0`,
+      `--hdr-scene-threshold-high=3.0`
+    - update defaults to `--deband-threshold=48`, `--deband-grain=32`
+    - add `--directory-mode=auto` and make it the default
+    - remove deprecated `--profile=opengl-hq`
+    - remove several legacy fallbacks for old deprecated options (now they will just
+      error out like normal)
+    - remove deprecated `drop-frame-count` and `vo-drop-frame-count` property aliases
+    - remove the ability to write to the `display-fps` property (use `override-display-fps`
+      instead)
+    - writing the current value to playlist-pos will no longer restart playback (use
+      `playlist-play-index` instead)
+    - remove deprecated `--oaoffset`, `--oafirst`, `--ovoffset`, `--ovfirst`,
+      `--demuxer-force-retry-on-eof`, `--fit-border` options
+    - remove deprecated `--record-file` option
+    - remove deprecated `--vf-defaults` and `--af-defaults` options
+    - `--drm-connector` no longer allows selecting the card number (use `--drm-device`
+      instead)
+    - add `--title-bar` option
+    - add `--window-corners` option
+    - rename `--cdrom-device` to `--cdda-device`
+    - remove `--scale-cutoff`, `--cscale-cutoff`, `--dscale-cutoff`, `--tscale-cutoff`
+    - remove `--scaler-lut-size`
+    - deprecate shared-script-properties (user-data is a replacement)
+    - add `--backdrop-type` option
+    - add `--window-affinity` option
+    - `--config-dir` no longer forces cache and state files to also reside in there
+    - deprecate `--demuxer-cue-codepage` in favor of `--metadata-codepage`
+    - change the default of `metadata-codepage` to `auto`
+    - add `playlist-next-playlist` and `playlist-prev-playlist` commands
+    - change `video-codec` to show description or name, not both
+    - deprecate `--cdda-toc-bias` option, offsets are always checked now
+    - disable `--allow-delayed-peak-detect` by default
+    - rename `--fps` to `--container-fps-override`
+    - rename `--override-display-fps` to `--display-fps-override`
+    - rename `--sub-ass-force-style` to `--sub-ass-style-overrides`
+    - alias `--screenshot-directory` to `--screenshot-dir`
+    - alias `--watch-later-directory` to `--watch-later-dir`
+    - rename `--play-dir` to `--play-direction`
+    - `--js-memory-report` is now used for enabling memory reporting for javascript
+      scripts
+    - drop support for `-del` syntax for list options
+    - `--demuxer-hysteresis-secs` now respects `--cache-secs` and/or
+      `--demuxer-readahead-secs` as well
+    - add hdr metadata to `video-params` property
+    - remove `hdr-metadata` property
+ --- mpv 0.36.0 ---
+    - add `--target-contrast`
+    - Target luminance value is now also applied when ICC profile is used.
+      `--icc-use-luma` has been added to use ICC profile luminance value.
+      If target luminance and ICC luminance is not used, old behavior apply,
+      defaulting to 203 nits. (Only applies for `--vo=gpu-next`)
+    - `playlist/N/title` gets set upon opening the file if it wasn't already set
+      and a title is available.
+    - add the `--vo=kitty` video output driver, as well as the options
+      `--vo-kitty-cols`, `--vo-kitty-rows`, `--vo-kitty-width`,
+      `--vo-kitty-height`, `--vo-kitty-left`, `--vo-kitty-top`,
+      `--vo-kitty-config-clear`, `--vo-kitty-alt-screen` and
+      `--vo-kitty-use-shm`
+    - add `--force-render`
+    - add `--vo-sixel-config-clear`, `--vo-sixel-alt-screen` and
+      `--vo-sixel-buffered`
+    - add `--wayland-content-type`
+    - deprecate `--vo-sixel-exit-clear` and alias it to
+      `--vo-sixel-alt-screen`
+    - deprecate `--drm-atomic`
+    - add `--demuxer-hysteresis-secs`
+    - add `--video-sync=display-tempo`
+    - the `start` option is no longer unconditionally written by
+      watch-later. It is still written by default but you may
+      need to explicitly add `start` depending on how you have
+      `--watch-later-options` configured.
+    - add `--vd-lavc-dr=auto` and make it the default
+    - add support for the fractional scale protocol in wayland
+    - in wayland, hidpi window scaling now scales the window by the compositor's
+      dpi scale factor by default (can be disabled with --no-hidpi-window-scale
+      if fractional scaling support exists).
+    - change --screenshot-tag-colorspace default value from `no` to `yes`
+    - undeprecate vf_sub
+    - add `--tone-mapping=st2094-40` and `--tone-mapping=st2094-10`
+    - change `--screenshot-jxl-effort` default from `3` to `4`.
+    - add `--tone-mapping-visualize`
+    - change type of `--brightness`, `--saturation`, `--contrast`, `--hue` and
+      `--gamma` to float.
+    - add `platform` property
+    - add `--auto-window-resize`
+    - `--save-position-on-quit` and its associated commands now store state files in
+      the XDG_STATE_HOME directory by default. This only has an effect on linux/bsd
+      systems.
+    - mpv now implictly saves cache files in XDG_CACHE_HOME by default. This only has
+      an effect if the user enables options that would lead to cache being stored and
+      only makes a difference on linux/bsd systems.
+    - `--cache-on-disk` no longer requires explictly setting the `--cache-dir` option
+    - add `--icc-cache` and `--gpu-shader-cache` options to control whether or not to
+      save cache files for these features; explictly setting `--icc-cache-dir` and
+      `--gpu-shader-cache` is no longer required
+    - remove the `--tone-mapping-crosstalk` option
+    - add `--gamut-mapping-mode=perceptual|relative|saturation|absolute|linear`
+    - add `--corner-rounding` option
+    - change `--subs-with-matching-audio` default from `yes` to `no`
+    - change `--slang` default from blank to `auto`
+    - add `--input-cursor-passthrough` option to allow pointer events to completely
+      passthrough the mpv window
+    - icc and gpu-shader cache are now saved by default (use --no-icc-shader-cache and
+      --no-gpu-shader-cache to disable)
+    - add `--directory-mode=recursive|lazy|ignore`
+    - `--hwdec=yes` is now mapped to `auto-safe` rather than `auto` (also used
+      by ctrl+h keybind)
+    - add `--hdr-contrast-recovery` and `--hdr-contrast-smoothness`
+    - include `--hdr-contrast-recovery` in the `gpu-hq` profile
+ --- mpv 0.35.0 ---
+    - add the `--vo=gpu-next` video output driver, as well as the options
+      `--allow-delayed-peak-detect`, `--builtin-scalers`,
+      `--interpolation-preserve` `--lut`, `--lut-type`, `--image-lut`,
+      `--image-lut-type` and `--target-lut` along with it.
+    - add `--target-colorspace-hint`
+    - add `--tone-mapping-crosstalk`
+    - add `--tone-mapping` options `auto`, `spline` and `bt.2446a`
+    - add `--inverse-tone-mapping`
+    - add `--gamut-mapping-mode`, replacing `--gamut-clipping` and `--gamut-warning`
+    - add `--tone-mapping-mode`, replacing `--tone-mapping-desaturate` and
+      `--tone-mapping-desaturate-exponent`.
+    - add `dolbyvision` sub-parameter to `format` video filter
+    - `--sub-visibility` no longer has any effect on secondary subtitles
+    - add `film-grain` sub-parameter to `format` video filter
+    - add experimental `--vo=dmabuf-wayland` video output driver
+    - add `--x11-present` for controlling whether to use xorg's present extension
+    - add `engine` option to the `rubberband` audio filter to support the new
+      engine introduced in rubberband 3.0.0. Defaults to `finer` (new engine).
+    - add `--wayland-configure-bounds` option
+    - deprecate `--gamma-factor`
+    - deprecate `--gamma-auto`
+    - remove `--vulkan-disable-events`
+    - add `--glsl-shader-opts`
+ --- mpv 0.34.0 ---
+    - deprecate selecting by card number with `--drm-connector`, add
+      `--drm-device` which can be used instead
+    - add `--screen-name` and `--fs-screen-name` flags to allow selecting the
+      screen by its name instead of the index
+    - add `--macos-geometry-calculation` to change the rectangle used for screen
+      position and size calculation. the old behavior used the whole screen,
+      which didn't take the menu bar and Dock into account. The new default
+      behaviour includes both. To revert to the old behavior set this to
+      `whole`.
+    - add an additional optional `albumart` argument to the `video-add` command,
+      which tells mpv to load the given video as album art.
+    - undeprecate `--cache-secs` option
+    - remove `--icc-contrast` and introduce `--icc-force-contrast`. The latter
+      defaults to the equivalent of the old `--icc-contrast=inf`, and can
+      instead be used to specifically set the contrast to any value.
+    - add a `--watch-later-options` option to allow configuring which
+      options quit-watch-later saves
+    - make `current-window-scale` writeable and use it in the default input.conf
+    - add `--input-builtin-bindings` flag to control loading of built-in key
+      bindings during start-up (default: yes).
+    - add ``track-list/N/image`` sub-property
+    - remove `--opengl-restrict` option
+    - js custom-init: use filename ~~/init.js instead of ~~/.init.js (dot)
+ --- mpv 0.33.0 ---
+    - add `--d3d11-exclusive-fs` flag to enable D3D11 exclusive fullscreen mode
+      when the player enters fullscreen.
+    - directories in ~/.mpv/scripts/ (or equivalent) now have special semantics
+      (see mpv Lua scripting docs)
+    - names starting with "." in ~/.mpv/scripts/ (or equivalent) are now ignored
+    - js modules: ~~/scripts/modules.js/ is no longer used, global paths can be
+      set with custom init (see docs), dir-scripts first look at <dir>/modules/
+    - the OSX bundle now logs to "~/Library/Logs/mpv.log" by default
+    - deprecate the --cache-secs option (once removed, the cache cannot be
+      limited by time anymore)
+    - remove deprecated legacy hook API ("hook-add", "hook-ack"). Use either the
+      libmpv API (mpv_hook_add(), mpv_hook_continue()), or the Lua scripting
+      wrappers (mp.add_hook()).
+    - improve how property change notifications are delivered on events and on
+      hooks. In particular, a hook event is only returned to a client after all
+      changes initiated before the hook point were delivered to the same client.
+      In addition, it should no longer happen that events and property change
+      notifications were interleaved in bad ways (it could happen that a
+      property notification delivered after an event contained a value that was
+      valid only before the event happened).
+    - the playlist-pos and playlist-pos-1 properties now can return and accept
+      -1, and are never unavailable. Out of range indexes are now accepted, but
+      behave like writing -1.
+    - the playlist-pos and playlist-pos-1 properties deprecate the current
+      behavior when writing back the current value to the property: currently,
+      this restarts playback, but in the future, it will do nothing.
+      Using the "playlist-play-index" command is recommended instead.
+    - add "playlist-play-index" command
+    - add playlist-current-pos, playlist-playing-pos properties
+    - Lua end-file events set the "error" field; this is deprecated; use the
+      "file_error" instead for this specific event. Scripts relying on the
+      "error" field for end-file will silently break at some point in the
+      future.
+    - remove deprecated --input-file option, add --input-ipc-client, which is
+      vaguely a replacement of the removed option, but not the same
+    - change another detail for track selection options (see --aid manpage
+      entry)
+    - reading loop-file property as native property or mpv_node will now return
+      "inf" instead of boolean true (also affects loop option)
+    - remove some --vo-direct3d-... options (it got dumbed down; use --vo=gpu)
+    - remove video-params/plane-depth property (was too vaguely defined)
+    - remove --video-sync-adrop-size option (implementation was changed, no
+      replacement for what this option did)
+    - undeprecate --video-sync=display-adrop
+    - deprecate legacy auto profiles (profiles starting with "extension." and
+      "protocol."). Use conditional auto profiles instead.
+    - the "subprocess" command does not connect spawned processes' stdin to
+      mpv's stdin anymore. Instead, stdin is connected to /dev/null by default.
+      To get the old behavior, set the "passthrough_stdin" argument to true.
+    - key/value list options do not accept ":" as item separator anymore,
+      only ",". This means ":" is always considered part of the value.
+    - remove deprecated --vo-vdpau-deint option
+    - add `delete-watch-later-config` command to complement
+      `write-watch-later-config`
+ --- mpv 0.32.0 ---
+    - change behavior when using legacy option syntax with options that start
+      with two dashes (``--`` instead of a ``-``). Now, using the recommended
+      syntax is required for options starting with ``--``, which means an option
+      value must be strictly passed after a ``=``, instead of as separate
+      argument. For example, ``--log-file f.txt`` was previously accepted and
+      behaved like ``--log-file=f.txt``, but now causes an error. Use of legacy
+      syntax that is still supported now prints a deprecation warning.
+ --- mpv 0.31.0 ---
+    - add `--resume-playback-check-mtime` to check consistent mtime when
+      restoring playback state.
+    - add `--d3d11-output-csp` to enable explicit selection of a D3D11
+      swap chain color space.
+    - the --sws- options and similar now affect vo_image and screenshot
+      conversion (does not matter as much for vo_gpu, which does most of this
+      with shaders)
+    - add a builtin "sw-fast" profile, which restores performance settings
+      for software video conversion. These were switched to higher quality since
+      mpv 0.30.0 (related to the previous changelog entry). This affects video
+      outputs like vo_x11 and vo_drm, and screenshots, but not much else.
+    - deprecate --input-file (there are no plans to remove this short-term,
+      but it will probably eventually go away <- that was a lie)
+    - deprecate --video-sync=display-adrop (might be removed if it's in the way;
+      undeprecated or readded if it's not too much of a problem)
+    - deprecate all input section commands (these will be changed/removed, as
+      soon as mpv internals do not require them anymore)
+    - remove deprecated --playlist-pos alias (use --playlist-start)
+    - deprecate --display-fps, introduce --override-display-fps. The display-fps
+      property now is unavailable if no VO exists (or the VO did not return a
+      display FPS), instead of returning the option value in this case. The
+      property will keep existing, but writing to it is deprecated.
+    - the vf/af properties now do not reject the set value anymore, even if
+      filter chain initialization fails. Instead, the vf/af options are always
+      set to the user's value, even if it does not reflect the "runtime" vf/af
+      chain.
+    - the vid/aid/sid/secondary-sid properties (and their aliases: "audio",
+      "video", "sub") will now allow setting any track ID; before this change,
+      only IDs of actually existing tracks could be set (the restriction was
+      active the MPV_EVENT_FILE_LOADED/"file-loaded" event was sent). Setting
+      an ID for which no track exists is equivalent to disabling it. Note that
+      setting the properties to non-existing tracks may report it as selected
+      track for a small time window, until it's forced back to "no". The exact
+      details how this is handled may change in the future.
+    - remove old Apple Remote support, including --input-appleremote
+    - add MediaPlayer support and remove the old Media Key event tap on macOS.
+      this possibly also re-adds the Apple Remote support
+    - the "edition" property now strictly returns the value of the option,
+      instead of the runtime value. The new "current-edition" property needs to
+      be queried to read the runtime-chosen edition. This is a breaking change
+      for any users which expected "edition" to return the runtime-chosen
+      edition at default settings (--edition=auto).
+    - the "window-scale" property now strictly returns the value of the option,
+      instead of the actual size of the window. The new "current-window-scale"
+      property needs to be queried to read the value as indicated by the current
+      window size. This is a breaking change.
+    - explicitly deprecate passing more than 1 item to "-add" suffix in key/value
+      options (for example --script-opts-add). This was actually always
+      deprecated, like with other list options, but the option parser did not
+      print a warning in this particular case.
+    - deprecate -del for list options (use -remove instead, which is by content
+      instead of by integer index)
+    - if `--fs` is used but `--fs-screen` is not set, mpv will now use `--screen`
+      instead.
+    - change the default of --hwdec to "no" on RPI. The default used to be "mmal"
+      specifically if 'Raspberry Pi support' was enabled at configure time
+      (equivalent to --enable-rpi). Use --hwdec=mmal to get the old behavior.
  --- mpv 0.30.0 ---
     - add `--d3d11-output-format` to enable explicit selection of a D3D11
       swap chain format.
@@ -191,6 +514,9 @@ Interface changes
       internal counter that remembered the current position.
     - remove deprecated ao/vo auto profiles. Consider using scripts like
       auto-profiles.lua instead.
+    - --[c]scale-[w]param[1|2] and --tone-mapping-param now accept "default",
+      and if set to that value, reading them as property will also return
+      "default", instead of float nan as in previous versions
  --- mpv 0.28.0 ---
     - rename --hwdec=mediacodec option to mediacodec-copy, to reflect
       conventions followed by other hardware video decoding APIs

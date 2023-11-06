@@ -1,30 +1,57 @@
-Release 0.30.0
+Release 0.36.0
 ==============
 
-This release has replaced the internal Vulkan rendering abstraction
-with libplacebo's more up-to-date implementation.
+This release requires FFmpeg 4.4 or newer.
+
+This is the last release to contain the waf build system.
+Meson is the primary and actively supported build system while waf is considered deprecated.
+
 
 Features
 --------
 
-Added
-~~~~~
+New
+~~~
 
-- vo_gpu: Vulkan API implementation based on libplacebo.
-- vo_drm: Add 30bpp support.
+- player: add window-id property
+- vo_kitty: introduce modern sixel alternative
+- wayland: add wp-fractional-scale-v1 support
+- player/command: add `user-data` property (replacement for `shared-script-properties`)
+- vo_gpu_next: support mapping HDR10+ dynamic metadata
+- vo_gpu_next: allow screenshots in native colorspace
+- vo_gpu_next: parse Dolby Vision metadata for dynamic scene brightness
+- video: allow csp equalizer adjustments with floating point precision
+- command: add platform property
+- demux_mkv: support ARIB captions
+- hwdec_vulkan: add support for Vulkan-based hardware decoding
+- player: better handling of forced-only subtitles and a toggle in the OSC
+- vo_dmabuf_wayland: add osd support
+
 
 Changed
 ~~~~~~~
 
-
-Deprecated
-~~~~~~~~~~
+- TOOLS/umpv: prefer $XDG_RUNTIME_DIR
+- ffmpeg: increase minimum required version to 4.4
+- player: choose speed of smallest acceptable factor for display sync
+- player: don't force saving `start` in watch-later-options
+- build: officially deprecate waf
+- vf_sub: undeprecate
+- player: set playlist title to media title if not set already
+- player: use and respect XDG_STATE_HOME and XDG_CACHE_HOME by default
+- wayland: bump required version to 1.20 and wayland-protocols to 1.25
+- ao_pipewire: require at least libpipewire 0.3.48
+- vo: hwdec: prioritise drmprime over drmprime_overlay
+- vo_gpu/vo_gpu_next: enable gpu shader and icc cache by default
 
 
 Removed
 ~~~~~~~
 
-- vo_gpu: Internal Vulkan API implementation.
+- drm: remove support for legacy (non-atomic) API
+- stream/dvb: drop support for DVB API before Linux 3.7
+- hwdec_cuda: drop support for PL_HANDLE_WIN32_KMT (Windows 7 only)
+- vo_dmabuf_wayland: drop linux-dmabuf-v2 support
 
 
 Options and Commands
@@ -33,160 +60,160 @@ Options and Commands
 Added
 ~~~~~
 
+- player: add --force-render option
+- demux: add --demuxer-hysteresis-secs option to save power with caching
+- ao_pipewire: allow usage of global volume control via --pipewire-volume-mode
+- vo_gpu_next: add --tone-mapping-visualize
+- sub: add --sub-fonts-dir and --osd-fonts-dir options
+- player: add --auto-window-resize
+- console.lua: add a script-opt for the border size
+- player: add --drag-and-drop option
+- vo_gpu_next: add --corner-rounding option
+- player: add more precise sub fallback options --subs-fallback and --subs-fallback-forced
+- player: add --input-cursor-passthrough option
+- TOOLS/lua/autoload: allow extending ext sets from script-opts
+- demux_playlist: add --directory-mode option to control recursive directory loading
+- vo_gpu_next: add --target-contrast and --hdr-contrast-recovery/smoothness
+
 
 Changed
 ~~~~~~~
+
+- vd_lavc: add "auto" choice for --vd-lavc-dr and make it the default
+ (notably this change was also backported to v0.35.1)
+- wayland: add auto choice to --wayland-configure-bounds
+- image_writer: change --screenshot-tag-colorspace default to yes
+- vo_gpu_next: expose --tone-mapping=st2094-40 and st2094-10
+- wayland: make --wayland-edge-pixels-pointer default to 16
+- options: enable scripts related opts also with cplugins
+- player/screenshot: add filename return field
+- options: set --subs-with-matching-audio to off by default
+- options: default --slang to auto, which uses the settings of the user's OS
+- vd_lavc: allow user to specify a priority list in --hwdec
+- vd_lavc: map hwdec=yes to hwdec=auto-safe and change ctrl+h to use auto-safe
 
 
 Deprecated
 ~~~~~~~~~~
 
+- drm: deprecate `--drm-atomic` (now always enabled)
+
 
 Removed
 ~~~~~~~
+
+- vo_gpu_next: remove --tone-mapping-crosstalk
 
 
 Fixes and Minor Enhancements
 ----------------------------
 
-
-
-Release 0.29.0
-==============
-
-This release requires FFmpeg 4.0 or newer.
-
-
-Features
---------
-
-Added
-~~~~~
-
-- ao/openal: Add better sample format and channel layout selection
-- ao/openal: Add support for direct channels output
-- cocoa-cb: initial implementation via opengl-cb API
-- context_drm_egl: Introduce 30bpp support (requires Mesa 18.0.0_rc4 or later)
-- osx: add some more menu bar items as suggested by Apples's HIG
-- vo_gpu: make screenshots use the GL renderer (#5498, #5240)
-- x11: support Shift+TAB as an input key bind (#5849)
-- ytdl_hook: support native dash demuxer, if present
-
-
-Changed
-~~~~~~~
-
-- ao_alsa, ao_pulse: reduce requested buffer size
-- audio: change format negotiation, remove channel remix fudging
-- client API: deprecate opengl-cb API and introduce a replacement API
-- demux: lower demuxer cache default sizes from 400MB/400MB to 50MB/150MB
-- osx: always deactivate the early opengl flush on macOS
-- scripting: change when/how player waits for scripts being loaded
-- vo_gpu: various improvements to HDR peak detection
-- vo_gpu: various improvements to HDR tone mapping
-- wayland_common: update to stable xdg-shell
-- ytdl_hook: parse youtube playlist urls to set start index if `--ytdl-raw-option=yes-playlist=` is specified
-
-Deprecated
-~~~~~~~~~~
-
-- af_lavrresample: deprecate this filter
-
-
-Removed
-~~~~~~~
-
-- build: drop support for SDL1 (only applied to ao_sdl)
-
-
-Options and Commands
---------------------
-
-Added
-~~~~~
-
-- add a number of --audio-resample-* options, which should from now on be used instead of --af-defaults=lavrresample:
-- ao/openal: --openal-direct-channels
-- command: add --osd-on-seek option defaulting to bar
-- command: add a change-list command (#5435)
-- options: add --http-proxy
-- options: add a builtin low-latency profile
-- vaapi: add option to select a non-default device path with --vaapi-device (#4320)
-- video: add option to reduce latency by 1 or 2 frames
-- vo_gpu: introduce --target-peak (#5521)
-
-
-Changed
-~~~~~~~
-
-- command: change cycle-value command behavior (#5772)
-- config: replace config dir lua-settings/ with dir script-opts/
-- options: --lavfi-complex now requires uniquely named filter pads.
-- options: --ytdl is now always enabled, even for libmpv
-- options: make --deinterlace=yes always deinterlace (#5219)
-- options: slightly improve filter help output for lavfi bridge
-- vo: rename --vo=opengl-cb to --vo=libmpv
-
-
-Deprecated
-~~~~~~~~~~
-
-- encoding: deprecate a bunch of obscure options (--ovoffset, --oaoffset, --ovfirst, --oafirst)
-- options: deprecate --vf-defaults and --af-defaults
-- osx: --gpu-context=cocoa with --gpu-api=opengl is now deprecated in favour of --vo=libmpv
-
-
-Removed
-~~~~~~~
-
-- command: remove an old compatibility hack that allowed CLI aliases to be set as property, deprecated in 0.26.0
-- input: remove legacy command handling for MPlayer commands that were deprecated in 2013
-- options: drop --opensles-sample-rate, as --audio-samplerate should be used if desired
-- options: drop deprecated --videotoolbox-format, --ff-aid, --ff-vid, --ff-sid, --ad-spdif-dtshd, --softvol options
-- options: remove --video-stereo-mode
-- options: remove deprecated ao/vo auto profiles
-- options: remove the following encoding options: --ocopyts (now the default, old timestamp handling is gone), --oneverdrop (now default), --oharddup (you need to use --vf=fps=VALUE), --ofps, --oautofps, --omaxfps
-
-
-Fixes and Minor Enhancements
-----------------------------
-
-- HIDRemote: fix volume buttons on macOS 10.13 (#5721)
-- TOOLS/autoload: Fix broken "disabled" option
-- TOOLS/autoload: be more robust with slow directory listings (#5618)
-- ao_sdl: fix default buffer size
-- build: add static libraries to libmpv.pc
-- build: bump waf to 2.0.9 (fixes Python 3.7 compatibility)
-- build: manually add standard library search paths for linking (#5791)
-- common: round all integer times to milliseconds
-- demux, player: fix playback of sparse video streams (w/ still images)
-- demux: support for some kinds of timed metadata (e.g. ICY)
-- demux_mkv: add V_AV1 identifier for AV1
-- demux_mkv: support Meridian Lossless Packing in Matroska (#5923)
-- display additional metadata tags during video playback
-- drm_atomic: Fix memory leaks in drm_atomic_create
-- enable cache for FUSE filesystems on OpenBSD and FreeBSD
-- gpu: prefer 16bit floating point FBO formats to 16bit integer ones
-- hwdec_vaegl: Fix VAAPI EGL interop used with gpu-context=drm
-- input.conf: use exact value for [ binding, which does the inverse of ]
-- input: add a keybinding to toggle hardware decoding
-- input: minor additions to default key bindings (#973)
-- osc: fix accidentally skipping files when seeking with slider
-- player: fix strange behavior on edition switching
-- player: fix track autoselection of external files yet again
-- terminal-unix: stop trying to read when terminal disappears (#5842)
-- video: actually wait for last frame being rendered on EOF
-- video: fix --video-rotate in some cases
-- video: fix crash with vdpau when reinitializing rendering (#5447)
-- vo_gpu: fix anamorphic screenshots (#5619)
-- vo_vdpau: fix resizing and rotation problems
+- ao_pipewire: log version and other useful debug info
+- wayland: error out if essential protocol support is missing
+- wayland: add support for content-type protocol
+- wayland: also log refresh rate on surface entrance
+- vo_gpu_next: fix undefined behavior on alpha-first formats
+- meson: prepend MPV_CONFDIR path with prefix
+- meson: unbreak dl check on BSDs without libdl
+- lcms: fix crash with lcms2-related options if lcms is disabled
+- meson: fix stdatomic detection on bsd
+- osc: don't spam window-controls bindings on every render
+- wayland: check for resize/move in touch event first
+- ao_coreaudio: use device's nominal sample rate for latency properties
+- hwdec_drmprime: support yuv420p format
+- ao_pipewire: properly clean up resources
+- vo/{sixel,tct}: use the alternate buffer to restore terminal
+- vo_sixel: add option to skip clear while drawing
+- filter_kernels: fix kaiser
+- hwdec/d3d11va: fix a possible memory leak
+- external_files: set log level for potential files to trace
+- external_files: recognize webp files as cover art
+- vo_opengl: do not blindly reject all Microsoft's OpenGL implementations
+- ao_coreaudio: use AudioUnitReset as ao_driver.reset to prevent long restart
+- hwdec_drmprime: fix memory leak
+- vo: hwdec: fix libdrm-related memory leak
+- draw_bmp: ensure last slice width is less than total width
+- demux: boost read EBU R128 gain values to ReplayGain's reference level
+- version.py: bump copyright year
+- TOOLS/umpv: support shell-quotes in $MPV
+- vulkan: fix build error for 32bit builds with clang
+- TOOLS/lua/autoload: improve and optimize the natural sorting
+- vo_wlshm: properly support video panscan
+- vo_dmabuf_wayland: support panscan and panning
+- ra_d3d11: fix incorrect type
+- meson: also search for rst2html with .py extension
+- audio: fix crash during uninit with ao_lavc
+- wayland: only warn about GNOME when actually missing idle inhibit support
+- mp_image: fix XYZ primaries default
+- msg: preserve early messages when log-file is set in mpv.conf
+- x11: fix issue with xpresent timing feedback
+- meson: reuse libmpv objects for cplayer to save 50% of compile steps
+- player/client: support observing sub-properties
+- m_property: implement new deletion operation on properties
+- vo_lavc: set frame rate on encoder to fix non-conforming outputs
+- player/video: don't resync audio if video is an image
+- stream: accept webdav:// and webdavs:// urls
+- video/image_writer: avoid stripping colorspace info when writing image
+- stats.lua: display HDR peak in nits
+- image_pool: fix memory leak with frames
+- options: transition from OPT_FLAG to OPT_BOOL
+- vd_lavc: sort hwdecs without hwdevices last for autoprobing
+- ytdl_hook: don't overwrite force-media-title
+- lua: use user-data for interop between osc.lua and console.lua
+- vo: fix race condition with redraw requests
+- various: more fixes to ensure correct playback of XYZ colorspace
+- ytdl_hook: fix fragment-related issue that broke YouTube DASH playback
+- command: expose hls-bitrate and program-id as track-list subproperties
+- ao_pipewire: use realtime scheduling for data thread
+- auto_profiles: check for non-existent properties
+- d3d11: retry device creation without debug, if SDK is not available
+- win32: follow Windows settings and update dark mode state
+- ytdl_hook.lua: fix clip start and end
+- hwdec_drmprime: support custom rpi4_8 and rpi4_10 formats
+- sub: fix UPDATE_SUB_HARD for converted and external subtitles
+- charset_conv: fix memory corruption in mp_iconv_to_utf8
+- options: read config file as stream
+- wayland: improve guessing when mpv is focused
+- player: always try to detect subtitle language from file name
+- vo: fix mp_frame_perf thread safety
+- lua: read_options: find script-opts prefix at index 1 exactly
+- path: handle URLs consistently in mp_basename
+- ao_wasapi: remove infinite loop hack in AOCONTROL_UPDATE_STREAM_TITLE
+- ao_wasapi: use client name instead of hardcoded string
+- vd_lavc: fix crash if hwdec devices fail to create
+- vo_drm: fix null dereference and using closed fd
+- image_writer: respect jpeg-quality when using ffmpeg for writing
+- image_writer: add support for AVIF
+- TOOLS/lua/autoload: avoid unnecessary playlist manipulation, performance
+- various: correctly ignore cache files with --no-config
+- terminal-unix: better error detection logic
+- json: raise parse depth to 50 for the sake of utils.parse_json()
+- player: delete watch_later file only after successful load
+- wayland: fix memory leak with multiple monitors
+- vd_lavc: prefer d3d11va-copy over dxva2-copy
+- vd_lavc: fix hwdec for videos with less than less than 3 frames
+- wayland: add support for suspended toplevel state
+- draw_bmp: ensure last slice is less than total width (again)
+- console.lua: sort the output from the help command
+- vd_lavc: try other hwdecs when falling back after an hwdec failure
+- sd_ass: don't reconfigure ass on every frame (performance regression)
+- sd_ass: fix converted subtitles having too-wide borders
+- loadfile: compute audio language for sub selection when using lavfi-complex
+- wayland: fix modifier keys in certain situations
+- vd_lavc: corrections towards hwdec and swdec fallback
+- zimg: fix broken sig_peak (HDR) handling
+- screenshot: implement `screenshot window` in sw for most VOs
+- osc: don't add margins to osc-deadzonesize
+- vo_vaapi: fix segfault in draw_osd
+- vo_dmabuf_wayland: correctly handle force-window
+- ao_pipewire: fix error with pipewire 0.3.75 or later
 
 
 This listing is not complete. Check DOCS/client-api-changes.rst for a history
 of changes to the client API, and DOCS/interface-changes.rst for a history
 of changes to other user-visible interfaces.
 
-A complete changelog can be seen by running `git log v0.28.2..v0.29.0`
+A complete changelog can be seen by running `git log v0.35.0..v0.36.0`
 in the git repository or by visiting either
-https://github.com/mpv-player/mpv/compare/v0.28.2...v0.29.0 or
-https://git.srsfckn.biz/mpv/log/?qt=range&q=v0.28.2..v0.29.0
+https://github.com/mpv-player/mpv/compare/v0.35.0...v0.36.0 or
+https://git.srsfckn.biz/mpv/log/?qt=range&q=v0.35.0..v0.36.0

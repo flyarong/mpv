@@ -17,6 +17,8 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdatomic.h>
+
 #import <Cocoa/Cocoa.h>
 #import <IOKit/pwr_mgt/IOPMLib.h>
 #import <IOKit/IOKitLib.h>
@@ -30,11 +32,8 @@
 #import "video/out/cocoa/mpvadapter.h"
 
 #include "osdep/threads.h"
-#include "osdep/atomic.h"
 #include "osdep/macosx_compat.h"
 #include "osdep/macosx_events_objc.h"
-
-#include "config.h"
 
 #include "osdep/timer.h"
 #include "osdep/macosx_application.h"
@@ -80,7 +79,7 @@ struct vo_cocoa_state {
     bool window_is_dragged;
     id event_monitor_mouseup;
 
-    bool embedded; // wether we are embedding in another GUI
+    bool embedded; // whether we are embedding in another GUI
 
     IOPMAssertionID power_mgmt_assertion;
     io_connect_t light_sensor;
@@ -93,17 +92,17 @@ struct vo_cocoa_state {
     uint32_t old_dwidth;
     uint32_t old_dheight;
 
-    pthread_mutex_t anim_lock;
-    pthread_cond_t anim_wakeup;
+    mp_mutex anim_lock;
+    mp_cond anim_wakeup;
     bool is_animating;
 
     CVDisplayLinkRef link;
-    pthread_mutex_t sync_lock;
-    pthread_cond_t sync_wakeup;
+    mp_mutex sync_lock;
+    mp_cond sync_wakeup;
     uint64_t sync_counter;
 
-    pthread_mutex_t lock;
-    pthread_cond_t wakeup;
+    mp_mutex lock;
+    mp_cond wakeup;
 
     // --- The following members are protected by the lock.
     //     If the VO and main threads are both blocked, locking is optional
@@ -138,9 +137,9 @@ static void queue_new_video_size(struct vo *vo, int w, int h)
 static void flag_events(struct vo *vo, int events)
 {
     struct vo_cocoa_state *s = vo->cocoa;
-    pthread_mutex_lock(&s->lock);
+    mp_mutex_lock(&s->lock);
     s->pending_events |= events;
-    pthread_mutex_unlock(&s->lock);
+    mp_mutex_unlock(&s->lock);
     if (events)
         vo_wakeup(vo);
 }
@@ -163,7 +162,7 @@ static void disable_power_management(struct vo_cocoa_state *s)
 }
 
 static const char macosx_icon[] =
-#include "osdep/macosx_icon.inc"
+#include "TOOLS/osxbundle/icon.icns.inc"
 ;
 
 static void set_application_icon(NSApplication *app)
@@ -185,7 +184,7 @@ static void set_application_icon(NSApplication *app)
 
 static int lmuvalue_to_lux(uint64_t v)
 {
-    // the polinomial approximation for apple lmu value -> lux was empirically
+    // the polynomial approximation for apple lmu value -> lux was empirically
     // derived by firefox developers (Apple provides no documentation).
     // https://bugzilla.mozilla.org/show_bug.cgi?id=793728
     double power_c4 = 1/pow((double)10,27);
@@ -302,26 +301,26 @@ static void vo_cocoa_update_screen_info(struct vo *vo)
 static void vo_cocoa_anim_lock(struct vo *vo)
 {
     struct vo_cocoa_state *s = vo->cocoa;
-    pthread_mutex_lock(&s->anim_lock);
+    mp_mutex_lock(&s->anim_lock);
     s->is_animating = true;
-    pthread_mutex_unlock(&s->anim_lock);
+    mp_mutex_unlock(&s->anim_lock);
 }
 
 static void vo_cocoa_anim_unlock(struct vo *vo)
 {
     struct vo_cocoa_state *s = vo->cocoa;
-    pthread_mutex_lock(&s->anim_lock);
+    mp_mutex_lock(&s->anim_lock);
     s->is_animating = false;
-    pthread_cond_signal(&s->anim_wakeup);
-    pthread_mutex_unlock(&s->anim_lock);
+    mp_cond_signal(&s->anim_wakeup);
+    mp_mutex_unlock(&s->anim_lock);
 }
 
 static void vo_cocoa_signal_swap(struct vo_cocoa_state *s)
 {
-    pthread_mutex_lock(&s->sync_lock);
+    mp_mutex_lock(&s->sync_lock);
     s->sync_counter += 1;
-    pthread_cond_signal(&s->sync_wakeup);
-    pthread_mutex_unlock(&s->sync_lock);
+    mp_cond_signal(&s->sync_wakeup);
+    mp_mutex_unlock(&s->sync_lock);
 }
 
 static void vo_cocoa_start_displaylink(struct vo_cocoa_state *s)
@@ -381,12 +380,12 @@ void vo_cocoa_init(struct vo *vo)
         .cursor_visibility_wanted = true,
         .fullscreen = 0,
     };
-    pthread_mutex_init(&s->lock, NULL);
-    pthread_cond_init(&s->wakeup, NULL);
-    pthread_mutex_init(&s->sync_lock, NULL);
-    pthread_cond_init(&s->sync_wakeup, NULL);
-    pthread_mutex_init(&s->anim_lock, NULL);
-    pthread_cond_init(&s->anim_wakeup, NULL);
+    mp_mutex_init(&s->lock);
+    mp_cond_init(&s->wakeup);
+    mp_mutex_init(&s->sync_lock);
+    mp_cond_init(&s->sync_wakeup);
+    mp_mutex_init(&s->anim_lock);
+    mp_cond_init(&s->anim_wakeup);
     vo->cocoa = s;
     vo_cocoa_update_screen_info(vo);
     vo_cocoa_init_displaylink(vo);
@@ -395,8 +394,10 @@ void vo_cocoa_init(struct vo *vo)
     cocoa_add_event_monitor(vo);
 
     if (!s->embedded) {
-        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-        set_application_icon(NSApp);
+        run_on_main_thread(vo, ^{
+            [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+            set_application_icon(NSApp);
+        });
     }
 }
 
@@ -426,15 +427,15 @@ void vo_cocoa_uninit(struct vo *vo)
 {
     struct vo_cocoa_state *s = vo->cocoa;
 
-    pthread_mutex_lock(&s->lock);
+    mp_mutex_lock(&s->lock);
     s->vo_ready = false;
-    pthread_cond_signal(&s->wakeup);
-    pthread_mutex_unlock(&s->lock);
+    mp_cond_signal(&s->wakeup);
+    mp_mutex_unlock(&s->lock);
 
-    pthread_mutex_lock(&s->anim_lock);
+    mp_mutex_lock(&s->anim_lock);
     while(s->is_animating)
-        pthread_cond_wait(&s->anim_wakeup, &s->anim_lock);
-    pthread_mutex_unlock(&s->anim_lock);
+        mp_cond_wait(&s->anim_wakeup, &s->anim_lock);
+    mp_mutex_unlock(&s->anim_lock);
 
     // close window beforehand to prevent undefined behavior when in fullscreen
     // that resets the desktop to space 1
@@ -465,12 +466,12 @@ void vo_cocoa_uninit(struct vo *vo)
         [s->view removeFromSuperview];
         [s->view release];
 
-        pthread_cond_destroy(&s->anim_wakeup);
-        pthread_mutex_destroy(&s->anim_lock);
-        pthread_cond_destroy(&s->sync_wakeup);
-        pthread_mutex_destroy(&s->sync_lock);
-        pthread_cond_destroy(&s->wakeup);
-        pthread_mutex_destroy(&s->lock);
+        mp_cond_destroy(&s->anim_wakeup);
+        mp_mutex_destroy(&s->anim_lock);
+        mp_cond_destroy(&s->sync_wakeup);
+        mp_mutex_destroy(&s->sync_lock);
+        mp_cond_destroy(&s->wakeup);
+        mp_mutex_destroy(&s->lock);
         talloc_free(s);
     });
 }
@@ -763,13 +764,13 @@ static void resize_event(struct vo *vo)
     struct vo_cocoa_state *s = vo->cocoa;
     NSRect frame = [s->video frameInPixels];
 
-    pthread_mutex_lock(&s->lock);
+    mp_mutex_lock(&s->lock);
     s->vo_dwidth  = frame.size.width;
     s->vo_dheight = frame.size.height;
     s->pending_events |= VO_EVENT_RESIZE | VO_EVENT_EXPOSE;
     // Live-resizing: make sure at least one frame will be drawn
     s->frame_w = s->frame_h = 0;
-    pthread_mutex_unlock(&s->lock);
+    mp_mutex_unlock(&s->lock);
 
     [s->nsgl_ctx update];
 
@@ -782,17 +783,17 @@ static void vo_cocoa_resize_redraw(struct vo *vo, int width, int height)
 
     resize_event(vo);
 
-    pthread_mutex_lock(&s->lock);
+    mp_mutex_lock(&s->lock);
 
     // Wait until a new frame with the new size was rendered. For some reason,
     // Cocoa requires this to be done before drawRect() returns.
-    struct timespec e = mp_time_us_to_timespec(mp_add_timeout(mp_time_us(), 0.1));
+    int64_t e = mp_time_ns() + MP_TIME_MS_TO_NS(100);
     while (s->frame_w != width && s->frame_h != height && s->vo_ready) {
-        if (pthread_cond_timedwait(&s->wakeup, &s->lock, &e))
+        if (mp_cond_timedwait_until(&s->wakeup, &s->lock, e))
             break;
     }
 
-    pthread_mutex_unlock(&s->lock);
+    mp_mutex_unlock(&s->lock);
 }
 
 void vo_cocoa_swap_buffers(struct vo *vo)
@@ -800,38 +801,38 @@ void vo_cocoa_swap_buffers(struct vo *vo)
     struct vo_cocoa_state *s = vo->cocoa;
 
     // Don't swap a frame with wrong size
-    pthread_mutex_lock(&s->lock);
+    mp_mutex_lock(&s->lock);
     bool skip = s->pending_events & VO_EVENT_RESIZE;
-    pthread_mutex_unlock(&s->lock);
+    mp_mutex_unlock(&s->lock);
     if (skip)
         return;
 
-    pthread_mutex_lock(&s->sync_lock);
+    mp_mutex_lock(&s->sync_lock);
     uint64_t old_counter = s->sync_counter;
     while(CVDisplayLinkIsRunning(s->link) && old_counter == s->sync_counter) {
-        pthread_cond_wait(&s->sync_wakeup, &s->sync_lock);
+        mp_cond_wait(&s->sync_wakeup, &s->sync_lock);
     }
-    pthread_mutex_unlock(&s->sync_lock);
+    mp_mutex_unlock(&s->sync_lock);
 
-    pthread_mutex_lock(&s->lock);
+    mp_mutex_lock(&s->lock);
     s->frame_w = vo->dwidth;
     s->frame_h = vo->dheight;
-    pthread_cond_signal(&s->wakeup);
-    pthread_mutex_unlock(&s->lock);
+    mp_cond_signal(&s->wakeup);
+    mp_mutex_unlock(&s->lock);
 }
 
 static int vo_cocoa_check_events(struct vo *vo)
 {
     struct vo_cocoa_state *s = vo->cocoa;
 
-    pthread_mutex_lock(&s->lock);
+    mp_mutex_lock(&s->lock);
     int events = s->pending_events;
     s->pending_events = 0;
     if (events & VO_EVENT_RESIZE) {
         vo->dwidth  = s->vo_dwidth;
         vo->dheight = s->vo_dheight;
     }
-    pthread_mutex_unlock(&s->lock);
+    mp_mutex_unlock(&s->lock);
 
     return events;
 }
@@ -867,15 +868,6 @@ static int vo_cocoa_control_on_main_thread(struct vo *vo, int request, void *arg
     struct vo_cocoa_state *s = vo->cocoa;
 
     switch (request) {
-    case VOCTRL_FULLSCREEN:
-        return vo_cocoa_fullscreen(vo);
-    case VOCTRL_GET_FULLSCREEN:
-        *(int *)arg = s->fullscreen;
-        return VO_TRUE;
-    case VOCTRL_ONTOP:
-        return vo_cocoa_ontop(vo);
-    case VOCTRL_BORDER:
-        return vo_cocoa_window_border(vo);
     case VOCTRL_GET_UNFS_WINDOW_SIZE: {
         int *sz = arg;
         NSRect rect = (s->fullscreen || vo->opts->fullscreen) ?
@@ -892,11 +884,6 @@ static int vo_cocoa_control_on_main_thread(struct vo *vo, int request, void *arg
         if(vo->opts->hidpi_window_scale)
             r = [s->current_screen convertRectToBacking:r];
         queue_new_video_size(vo, r.size.width, r.size.height);
-        return VO_TRUE;
-    }
-    case VOCTRL_GET_WIN_STATE: {
-        const bool minimized = [[s->view window] isMiniaturized];
-        *(int *)arg = minimized ? VO_WIN_STATE_MINIMIZED : 0;
         return VO_TRUE;
     }
     case VOCTRL_SET_CURSOR_VISIBILITY:
@@ -1048,7 +1035,6 @@ int vo_cocoa_control(struct vo *vo, int *events, int request, void *arg)
 {
     struct vo_cocoa_state *s = self.vout->cocoa;
     s->fullscreen = 1;
-    s->pending_events |= VO_EVENT_FULLSCREEN_STATE;
     vo_cocoa_anim_unlock(self.vout);
 }
 
@@ -1056,7 +1042,6 @@ int vo_cocoa_control(struct vo *vo, int *events, int request, void *arg)
 {
     struct vo_cocoa_state *s = self.vout->cocoa;
     s->fullscreen = 0;
-    s->pending_events |= VO_EVENT_FULLSCREEN_STATE;
     vo_cocoa_anim_unlock(self.vout);
 }
 
@@ -1107,16 +1092,6 @@ int vo_cocoa_control(struct vo *vo, int *events, int request, void *arg)
 - (void)windowDidBecomeKey:(NSNotification *)notification
 {
     vo_cocoa_update_cursor_visibility(self.vout, false);
-}
-
-- (void)windowDidMiniaturize:(NSNotification *)notification
-{
-    flag_events(self.vout, VO_EVENT_WIN_STATE);
-}
-
-- (void)windowDidDeminiaturize:(NSNotification *)notification
-{
-    flag_events(self.vout, VO_EVENT_WIN_STATE);
 }
 
 - (void)windowWillMove:(NSNotification *)notification

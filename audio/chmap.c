@@ -52,6 +52,11 @@ static const char *const speaker_names[MP_SPEAKER_ID_COUNT][2] = {
     [MP_SPEAKER_ID_SDL]         = {"sdl",  "surround direct left"},
     [MP_SPEAKER_ID_SDR]         = {"sdr",  "surround direct right"},
     [MP_SPEAKER_ID_LFE2]        = {"lfe2", "low frequency 2"},
+    [MP_SPEAKER_ID_TSL]         = {"tsl",  "top side left"},
+    [MP_SPEAKER_ID_TSR]         = {"tsr",  "top side right"},
+    [MP_SPEAKER_ID_BFC]         = {"bfc",  "bottom front center"},
+    [MP_SPEAKER_ID_BFL]         = {"bfl",  "bottom front left"},
+    [MP_SPEAKER_ID_BFR]         = {"bfr",  "bottom front right"},
     [MP_SPEAKER_ID_NA]          = {"na",   "not available"},
 };
 
@@ -83,7 +88,7 @@ static const char *const std_layout_names[][2] = {
     {"6.0(front)",      "fl-fr-flc-frc-sl-sr"},
     {"hexagonal",       "fl-fr-fc-bl-br-bc"},
     {"6.1",             "fl-fr-fc-lfe-bc-sl-sr"},
-    {"6.1(back)",       "fl-fr-fc-lfe-bl-br-bc"}, // lavc calls this "6.1" too
+    {"6.1(back)",       "fl-fr-fc-lfe-bl-br-bc"},
     {"6.1(top)",        "fl-fr-fc-lfe-bl-br-tc"}, // not in lavc
     {"6.1(front)",      "fl-fr-lfe-flc-frc-sl-sr"},
     {"7.0",             "fl-fr-fc-bl-br-sl-sr"},
@@ -93,8 +98,13 @@ static const char *const std_layout_names[][2] = {
     {"7.1(alsa)",       "fl-fr-bl-br-fc-lfe-sl-sr"}, // not in lavc
     {"7.1(wide)",       "fl-fr-fc-lfe-bl-br-flc-frc"},
     {"7.1(wide-side)",  "fl-fr-fc-lfe-flc-frc-sl-sr"},
+    {"7.1(top)",        "fl-fr-fc-lfe-bl-br-tfl-tfr"},
     {"7.1(rear)",       "fl-fr-fc-lfe-bl-br-sdl-sdr"}, // not in lavc
     {"octagonal",       "fl-fr-fc-bl-br-bc-sl-sr"},
+    {"cube",            "fl-fr-bl-br-tfl-tfr-tbl-tbr"},
+    {"hexadecagonal",   "fl-fr-fc-bl-br-bc-sl-sr-tfc-tfl-tfr-tbl-tbc-tbr-wl-wr"},
+    {"downmix",         "fl-fr"},
+    {"22.2",            "fl-fr-fc-lfe-bl-br-flc-frc-bc-sl-sr-tc-tfl-tfc-tfr-tbl-tbc-tbr-lfe2-tsl-tsr-bfc-bfl-bfr"},
     {"auto",            ""}, // not in lavc
     {0}
 };
@@ -468,6 +478,23 @@ char *mp_chmap_to_str_hr_buf(char *buf, size_t buf_size, const struct mp_chmap *
         }
     }
     return mp_chmap_to_str_buf(buf, buf_size, &map);
+}
+
+mp_ch_layout_tuple *mp_iterate_builtin_layouts(void **opaque)
+{
+    uintptr_t i = (uintptr_t)*opaque;
+
+    if (i >= MP_ARRAY_SIZE(std_layout_names) ||
+        !std_layout_names[i][0])
+        return NULL;
+
+    *opaque = (void *)(i + 1);
+
+    if (std_layout_names[i][1][0] == '\0') {
+        return mp_iterate_builtin_layouts(opaque);
+    }
+
+    return &std_layout_names[i];
 }
 
 void mp_chmap_print_help(struct mp_log *log)

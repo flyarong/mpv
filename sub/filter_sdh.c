@@ -15,9 +15,12 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stdlib.h>
 #include <assert.h>
+#include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <stddef.h>
+
 #include "misc/ctype.h"
 #include "common/common.h"
 #include "common/msg.h"
@@ -43,7 +46,7 @@ static void init_buf(struct buffer *buf, int length)
     buf->length = length;
 }
 
-static inline int append(struct sd *sd, struct buffer *buf, char c)
+static inline int append(struct sd_filter *sd, struct buffer *buf, char c)
 {
     if (buf->pos >= 0 && buf->pos < buf->length) {
         buf->string[buf->pos++] = c;
@@ -66,7 +69,7 @@ static inline int append(struct sd *sd, struct buffer *buf, char c)
 //
 // on return the read pointer is updated to the position after
 // the tags.
-static void copy_ass(struct sd *sd, char **rpp, struct buffer *buf)
+static void copy_ass(struct sd_filter *sd, char **rpp, struct buffer *buf)
 {
     char *rp = *rpp;
 
@@ -82,6 +85,8 @@ static void copy_ass(struct sd *sd, char **rpp, struct buffer *buf)
 
     return;
 }
+
+static bool skip_bracketed(struct sd_filter *sd, char **rpp, struct buffer *buf);
 
 // check for speaker label, like MAN:
 // normal subtitles may include mixed case text with : after so
@@ -99,7 +104,7 @@ static void copy_ass(struct sd *sd, char **rpp, struct buffer *buf)
 // if no label was found read pointer and write position in buffer
 // will be unchanged
 // otherwise they point to next position after label and next write position
-static void skip_speaker_label(struct sd *sd, char **rpp, struct buffer *buf)
+static void skip_speaker_label(struct sd_filter *sd, char **rpp, struct buffer *buf)
 {
     int filter_harder = sd->opts->sub_filter_SDH_harder;
     char *rp = *rpp;
@@ -121,6 +126,12 @@ static void skip_speaker_label(struct sd *sd, char **rpp, struct buffer *buf)
     while (*rp && rp[0] != ':') {
         if (rp[0] == '{') {
             copy_ass(sd, &rp, buf);
+        } else if (rp[0] == '[') {
+            // not uncommon with [xxxx]: which should also be skipped
+            if (!skip_bracketed(sd, &rp, buf)) {
+                buf->pos = old_pos;
+                return;
+            }
         } else if ((mp_isalpha(rp[0]) &&
                     (filter_harder || mp_isupper(rp[0]) || rp[0] == 'l')) ||
                    mp_isdigit(rp[0]) ||
@@ -179,7 +190,7 @@ static void skip_speaker_label(struct sd *sd, char **rpp, struct buffer *buf)
 // return true if bracketed text was removed.
 // if not valid SDH read pointer and write buffer position will be unchanged
 // otherwise they point to next position after text and next write position
-static bool skip_bracketed(struct sd *sd, char **rpp, struct buffer *buf)
+static bool skip_bracketed(struct sd_filter *sd, char **rpp, struct buffer *buf)
 {
     char *rp = *rpp;
     int old_pos = buf->pos;
@@ -208,7 +219,7 @@ static bool skip_bracketed(struct sd *sd, char **rpp, struct buffer *buf)
     return true;
 }
 
-// check for paranthesed text, like (SOUND)
+// check for parenthesized text, like (SOUND)
 // and skip it while preserving ass tags
 // normal subtitles may include mixed case text in parentheses so
 // only upper case is accepted and lower case l which for some
@@ -222,12 +233,12 @@ static bool skip_bracketed(struct sd *sd, char **rpp, struct buffer *buf)
 // scan in source string
 // the first character in source string must be the starting '('
 // and copy ass tags to destination string but
-// skipping paranthesed text if it looks like SDH
+// skipping parenthesized text if it looks like SDH
 //
-// return true if paranthesed text was removed.
+// return true if parenthesized text was removed.
 // if not valid SDH read pointer and write buffer position will be unchanged
 // otherwise they point to next position after text and next write position
-static bool skip_parenthesed(struct sd *sd, char **rpp, struct buffer *buf)
+static bool skip_parenthesized(struct sd_filter *sd, char **rpp, struct buffer *buf)
 {
     int filter_harder = sd->opts->sub_filter_SDH_harder;
     char *rp = *rpp;
@@ -281,11 +292,12 @@ static bool skip_parenthesed(struct sd *sd, char **rpp, struct buffer *buf)
 //
 // when removing characters the following are moved back
 //
-static void remove_leading_hyphen_space(struct sd *sd, int start_pos, struct buffer *buf)
+static void remove_leading_hyphen_space(struct sd_filter *sd, int start_pos,
+                                        struct buffer *buf)
 {
     int old_pos = buf->pos;
     if (start_pos < 0 || start_pos >= old_pos)
-        return; 
+        return;
     append(sd, buf, '\0');  // \0 terminate for reading
 
     // move past leading ass tags
@@ -321,10 +333,9 @@ static void remove_leading_hyphen_space(struct sd *sd, int start_pos, struct buf
 // Filter ASS formatted string for SDH
 //
 // Parameters:
-//     format       format line from ASS configuration
-//     n_ignored    number of comma to skip as preprocessing have removed them
-//     data         ASS line. null terminated string if length == 0
-//     length       length of ASS input if not null terminated, 0 otherwise
+//     data         ASS line
+//     length       length of ASS line
+//     toff         Text offset from data. required: 0 <= toff <= length
 //
 // Returns  a talloc allocated string with filtered ASS data (may be the same
 // content as original if no SDH was found) which must be released
@@ -332,49 +343,16 @@ static void remove_leading_hyphen_space(struct sd *sd, int start_pos, struct buf
 //
 // Returns NULL if filtering resulted in all of ASS data being removed so no
 // subtitle should be output
-char *filter_SDH(struct sd *sd, char *format, int n_ignored, char *data, int length)
+static char *filter_SDH(struct sd_filter *sd, char *data, int length, ptrdiff_t toff)
 {
-    if (!format) {
-        MP_VERBOSE(sd, "SDH filtering not possible - format missing\n");
-        return length ? talloc_strndup(NULL, data, length) : talloc_strdup(NULL, data);
-    }
-
-    // need null terminated string
-    char *ass = length ? talloc_strndup(NULL, data, length) : data;
-
-    int comma = 0;
-    // scan format line to find the number of the field where the text is
-    for (char *c = format; *c; c++) {
-        if (*c == ',') {
-            comma++;
-            if (strncasecmp(c + 1, "Text", 4) == 0)
-                break;
-        }
-    }
-    // if preprocessed line some fields are skipped
-    comma -= n_ignored;
-
     struct buffer writebuf;
     struct buffer *buf = &writebuf;
+    init_buf(buf, length + 1); // with room for terminating '\0'
 
-    init_buf(buf, strlen(ass) + 1); // with room for terminating '\0'
-
-    char *rp = ass;
-
-    // locate text field in ASS line
-    for (int k = 0; k < comma; k++) {
-        while (*rp) {
-            char tmp = append(sd, buf, rp[0]);
-            rp++;
-            if (tmp == ',')
-                break;
-        }
-    }
-    if (!*rp) {
-        talloc_free(buf->string);
-        MP_VERBOSE(sd, "SDH filtering not possible - cannot find text field\n");
-        return length ? ass : talloc_strdup(NULL, ass);
-    }
+    // pre-text headers into buf, rp is the (null-terminated) remaining text
+    char *ass = talloc_strndup(NULL, data, length), *rp = ass;
+    while (rp - ass < toff)
+        append(sd, buf, *rp++);
 
     bool contains_text = false;  // true if non SDH text was found
     bool line_with_text = false; // if last line contained text
@@ -400,7 +378,7 @@ char *filter_SDH(struct sd *sd, char *format, int n_ignored, char *data, int len
                     line_with_text =  true;
                 }
             } else if (rp[0] == '(') {
-                if (!skip_parenthesed(sd, &rp, buf)) {
+                if (!skip_parenthesized(sd, &rp, buf)) {
                     append(sd, buf, rp[0]);
                     rp++;
                     line_with_text =  true;
@@ -435,15 +413,15 @@ char *filter_SDH(struct sd *sd, char *format, int n_ignored, char *data, int len
             }
         }
     }
-    // if no normal text i last line - remove last line
+    // if no normal text in last line - remove last line
     // by moving write pointer to start of last line
     if (!line_with_text) {
         buf->pos = wp_line_end;
     } else {
         contains_text = true;
     }
-    if (length)
-        talloc_free(ass);
+    talloc_free(ass);
+
     if (contains_text) {
         // the ASS data contained normal text after filtering
         append(sd, buf, '\0'); // '\0' terminate
@@ -454,3 +432,51 @@ char *filter_SDH(struct sd *sd, char *format, int n_ignored, char *data, int len
         return NULL;
     }
 }
+
+static bool sdh_init(struct sd_filter *ft)
+{
+    if (strcmp(ft->codec, "ass") != 0)
+        return false;
+
+    if (!ft->opts->sub_filter_SDH)
+        return false;
+
+    if (!ft->event_format) {
+        MP_VERBOSE(ft, "SDH filtering not possible - format missing\n");
+        return false;
+    }
+
+    return true;
+}
+
+static struct demux_packet *sdh_filter(struct sd_filter *ft,
+                                       struct demux_packet *pkt)
+{
+    bstr text = sd_ass_pkt_text(ft, pkt, sd_ass_fmt_offset(ft->event_format));
+    if (!text.start || !text.len || pkt->len >= INT_MAX)
+        return pkt;  // we don't touch it
+
+    ptrdiff_t toff = text.start - pkt->buffer;
+    char *line = filter_SDH(ft, (char *)pkt->buffer, (int)pkt->len, toff);
+    if (!line)
+        return NULL;
+    if (0 == bstrcmp0((bstr){(char *)pkt->buffer, pkt->len}, line)) {
+        talloc_free(line);
+        return pkt;  // unmodified, no need to allocate new packet
+    }
+
+    // Stupidly, this copies it again. One could possibly allocate the packet
+    // for writing in the first place (new_demux_packet()) and use
+    // demux_packet_shorten().
+    struct demux_packet *npkt = new_demux_packet_from(line, strlen(line));
+    if (npkt)
+        demux_packet_copy_attribs(npkt, pkt);
+
+    talloc_free(line);
+    return npkt;
+}
+
+const struct sd_filter_functions sd_filter_sdh = {
+    .init   = sdh_init,
+    .filter = sdh_filter,
+};

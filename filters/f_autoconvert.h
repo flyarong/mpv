@@ -1,8 +1,10 @@
 #pragma once
 
 #include "filter.h"
+#include "video/sws_utils.h"
 
 struct mp_image;
+struct mp_image_params;
 
 // A filter which automatically creates and uses a conversion filter based on
 // the filter settings, or passes through data unchanged if no conversion is
@@ -10,6 +12,8 @@ struct mp_image;
 struct mp_autoconvert {
     // f->pins[0] is input, f->pins[1] is output
     struct mp_filter *f;
+
+    enum mp_sws_scaler force_scaler;
 
     // If this is set, the callback is invoked (from the process function), and
     // further data flow is blocked until mp_autoconvert_format_change_continue()
@@ -22,11 +26,19 @@ struct mp_autoconvert {
 // (to free this, free the filter itself, mp_autoconvert.f)
 struct mp_autoconvert *mp_autoconvert_create(struct mp_filter *parent);
 
+// Require that output frames have the following params set.
+// This implicitly clears the image format list, and calls
+// mp_autoconvert_add_imgfmt() with the values in *p.
+// Idempotent on subsequent calls (no reinit forced if parameters don't change).
+// Mixing this with other format-altering calls has undefined effects.
+void mp_autoconvert_set_target_image_params(struct mp_autoconvert *c,
+                                            struct mp_image_params *p);
+
 // Add the imgfmt as allowed video image format, and error on non-video frames.
 // Each call adds to the list of allowed formats. Before the first call, all
 // formats are allowed (even non-video).
 // subfmt can be used to specify underlying surface formats for hardware formats,
-// otherwise must be 0.
+// otherwise must be 0. (Mismatches lead to conversion errors.)
 void mp_autoconvert_add_imgfmt(struct mp_autoconvert *c, int imgfmt, int subfmt);
 
 // Add all sw image formats. The effect is that hardware video image formats are

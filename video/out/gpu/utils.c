@@ -39,6 +39,21 @@ void gl_transform_ortho_fbo(struct gl_transform *t, struct ra_fbo fbo)
     gl_transform_ortho(t, 0, fbo.tex->params.w, 0, fbo.tex->params.h * y_dir);
 }
 
+float gl_video_scale_ambient_lux(float lmin, float lmax,
+                                 float rmin, float rmax, float lux)
+{
+    assert(lmax > lmin);
+
+    float num = (rmax - rmin) * (log10(lux) - log10(lmin));
+    float den = log10(lmax) - log10(lmin);
+    float result = num / den + rmin;
+
+    // clamp the result
+    float max = MPMAX(rmax, rmin);
+    float min = MPMIN(rmax, rmin);
+    return MPMAX(MPMIN(result, max), min);
+}
+
 void ra_buf_pool_uninit(struct ra *ra, struct ra_buf_pool *pool)
 {
     for (int i = 0; i < pool->num_buffers; i++)
@@ -185,7 +200,7 @@ bool ra_tex_resize(struct ra *ra, struct mp_log *log, struct ra_tex **tex,
 
     mp_dbg(log, "Resizing texture: %dx%d\n", w, h);
 
-    if (!fmt || !fmt->renderable || !fmt->linear_filter || !fmt->storable) {
+    if (!fmt || !fmt->renderable || !fmt->linear_filter) {
         mp_err(log, "Format %s not supported.\n", fmt ? fmt->name : "(unset)");
         return false;
     }
@@ -200,7 +215,7 @@ bool ra_tex_resize(struct ra *ra, struct mp_log *log, struct ra_tex **tex,
         .src_linear = true,
         .render_src = true,
         .render_dst = true,
-        .storage_dst = true,
+        .storage_dst = fmt->storable,
         .blit_src = true,
     };
 

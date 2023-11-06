@@ -52,7 +52,7 @@ Input
 * Classic LIRC support was removed. Install remotes as input devices instead.
   This way they will send X11 key events to the mpv window, which can be bound
   using the normal ``input.conf``.
-  Also see: http://github.com/mpv-player/mpv/wiki/IR-remotes
+  Also see: https://github.com/mpv-player/mpv/wiki/IR-remotes
 * Joystick support was removed. It was considered useless and was the cause
   of some problems (e.g. a laptop's accelerator being recognized as joystick).
 * Support for relative seeking by percentage.
@@ -144,7 +144,6 @@ Mac OS X
 * Native OpenGL backend.
 * Cocoa event loop is independent from MPlayer's event loop, so user
   actions like accessing menus and live resizing do not block the playback.
-* Apple Remote support.
 * Media Keys support.
 * VDA support using libavcodec hwaccel API instead of FFmpeg's decoder with up
   to 2-2.5x reduction in CPU usage.
@@ -215,7 +214,7 @@ Command Line Switches
     ``-af volnorm``             (removed; use acompressor ffmpeg filter instead)
     ``-afm hwac3``              ``--ad=spdif:ac3,spdif:dts``
     ``-ao alsa:device=hw=0.3``  ``--ao=alsa:device=[hw:0,3]``
-    ``-aspect``                 ``--video-aspect``
+    ``-aspect``                 ``--video-aspect-override``
     ``-ass-bottom-margin``      ``--vf=sub=bottom:top``
     ``-ass``                    ``--sub-ass``
     ``-audiofile-cache``        (removed; the main cache settings are used)
@@ -230,7 +229,7 @@ Command Line Switches
     ``-endpos``                 ``--length``
     ``-fixed-vo``               (removed; always the default)
     ``-font``                   ``--osd-font``
-    ``-forcedsubsonly``         ``--sub-forced-only``
+    ``-forcedsubsonly``         ``--sub-forced-events-only``
     ``-forceidx``               ``--index``
     ``-format``                 ``--audio-format``
     ``-fsmode-dontuse``         (removed)
@@ -248,7 +247,7 @@ Command Line Switches
     ``-msglevel``               ``--msg-level`` (changed semantics)
     ``-msgmodule``              ``--msg-module``
     ``-name``                   ``--x11-name``
-    ``-noar``                   ``--no-input-appleremote``
+    ``-noar``                   ``(removed; replaced by MediaPlayer framework)``
     ``-noautosub``              ``--no-sub-auto``
     ``-noconsolecontrols``      ``--no-input-terminal``
     ``-nosound``                ``--no-audio``
@@ -322,9 +321,9 @@ input.conf and Slave Commands
     +--------------------------------+----------------------------------------+
     | ``pt_step -1 [0|1]``           | ``playlist-prev [weak|force] (same)``  |
     +--------------------------------+----------------------------------------+
-    | ``switch_ratio [<ratio>]``     | ``set video-aspect <ratio>``           |
+    | ``switch_ratio [<ratio>]``     | ``set video-aspect-override <ratio>``  |
     |                                |                                        |
-    |                                | ``set video-aspect 0`` (reset aspect)  |
+    |                                | ``set video-aspect-override 0`` (reset)|
     +--------------------------------+----------------------------------------+
     | ``step_property_osd <prop>``   | ``cycle <prop> <step>`` (wraps),       |
     | ``<step> <dir>``               | ``add <prop> <step>`` (clamps).        |

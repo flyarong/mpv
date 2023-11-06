@@ -73,6 +73,20 @@
 #define AACS_ERROR_MMC_FAILURE    -7 /* MMC failed */
 #define AACS_ERROR_NO_DK          -8 /* no matching device key */
 
+
+struct bluray_opts {
+    char *bluray_device;
+};
+
+#define OPT_BASE_STRUCT struct bluray_opts
+const struct m_sub_options stream_bluray_conf = {
+    .opts = (const struct m_option[]) {
+        {"device", OPT_STRING(bluray_device), .flags = M_OPT_FILE},
+        {0},
+    },
+    .size = sizeof(struct bluray_opts),
+};
+
 struct bluray_priv_s {
     BLURAY *bd;
     BLURAY_TITLE_INFO *title_info;
@@ -86,6 +100,8 @@ struct bluray_priv_s {
     char *cfg_device;
 
     bool use_nav;
+    struct bluray_opts *opts;
+    struct m_config_cache *opts_cache;
 };
 
 static void destruct(struct bluray_priv_s *priv)
@@ -161,7 +177,7 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
     }
 }
 
-static int bluray_stream_fill_buffer(stream_t *s, char *buf, int len)
+static int bluray_stream_fill_buffer(stream_t *s, void *buf, int len)
 {
     struct bluray_priv_s *b = s->priv;
     BD_EVENT event;
@@ -283,9 +299,6 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
         *(char**)arg = talloc_strdup(NULL, meta->di_name);
         return STREAM_OK;
     }
-    case STREAM_CTRL_GET_SIZE:
-        *(int64_t *)arg = bd_get_title_size(b->bd);
-        return STREAM_OK;
     default:
         break;
     }
@@ -380,8 +393,7 @@ static int bluray_stream_open_internal(stream_t *s)
     if (b->cfg_device && b->cfg_device[0]) {
         device = b->cfg_device;
     } else {
-        mp_read_option_raw(s->global, "bluray-device", &m_option_type_string,
-                           &device);
+        device = b->opts->bluray_device;
     }
 
     if (!device || !device[0]) {
@@ -469,6 +481,12 @@ static int bluray_stream_open(stream_t *s)
     struct bluray_priv_s *b = talloc_zero(s, struct bluray_priv_s);
     s->priv = b;
 
+    struct m_config_cache *opts_cache =
+        m_config_cache_alloc(s, s->global, &stream_bluray_conf);
+
+    b->opts_cache = opts_cache;
+    b->opts = opts_cache->opts;
+
     b->use_nav = s->info == &stream_info_bdnav;
 
     bstr title, bdevice, rest = { .len = 0 };
@@ -515,12 +533,14 @@ const stream_info_t stream_info_bluray = {
     .name = "bd",
     .open = bluray_stream_open,
     .protocols = (const char*const[]){ "bd", "br", "bluray", NULL },
+    .stream_origin = STREAM_ORIGIN_UNSAFE,
 };
 
 const stream_info_t stream_info_bdnav = {
     .name = "bdnav",
     .open = bluray_stream_open,
     .protocols = (const char*const[]){ "bdnav", "brnav", "bluraynav", NULL },
+    .stream_origin = STREAM_ORIGIN_UNSAFE,
 };
 
 static bool check_bdmv(const char *path)
@@ -608,4 +628,5 @@ const stream_info_t stream_info_bdmv_dir = {
     .name = "bdmv/bluray",
     .open = bdmv_dir_stream_open,
     .protocols = (const char*const[]){ "file", "", NULL },
+    .stream_origin = STREAM_ORIGIN_UNSAFE,
 };
